@@ -20,6 +20,7 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 %.o: %.vb
     $(call OBJCOPYME)
 ```
+- Clone this repo and place the folder in the working directory (seq_player directory is in the same directory as all the individual nolibgs_hello_worlds examples)
 - Run make in the seq_player directory
 - Note: If the program does not compile due to a FntPrint error, add an ellipsis (...) to the FntPrint definition in [libgpu.h](https://github.com/johnbaumann/psyq_include_what_you_use/blob/5cbf9f68d10490949b43b52846dae8a6383d5c55/include/libgpu.h#L724) on the psyq/include directory. Line 724 should look like this ```extern int FntPrint(...);```
 ## Usage
