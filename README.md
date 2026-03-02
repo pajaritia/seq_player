@@ -34,7 +34,13 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 - Plays .seq files with a selected soundbank, can change soundbank parameters during playback. Some parameters like reverb type will require playback to restart.
 - Can play single notes using data from a soundbank.
 - In both modes the Program Editor can be selected to edit program settings, selecting a tone will open the Tone Editor to edit Tone settings.
-- ADSR numeric hex value can be edited.
-- Changes are volatile in the RAM, reloading the soundbank may undo any changes.
+- ADSR values can be edited.
+- Changes are volatile in the RAM, reloading the soundbank may undo any changes. (This may no longer occur, uncertain)
+
+## Optional features
+- A background image can be provided by placing a 16bpp, 320x240 pixel resolution .TIM image in the IMG directory. (/IMG/image.tim)
+- If an image is detected the program will load it into VRAM
+- Pressing SELECT in the initial screen, the SEQ playback screen or the VAB playback screen will toggle between 3 background modes (no image, image + program text, image only)
+
 ## Video
 https://www.youtube.com/watch?v=wyz4xGdSDhg
