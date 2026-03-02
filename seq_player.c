@@ -31,7 +31,8 @@ typedef enum {
     STATE_VAB_VH_SELECT,
     STATE_VAB_PLAYBACK,
     STATE_PROGRAM_EDIT,
-    STATE_TONE_EDIT
+    STATE_TONE_EDIT,
+    STATE_ADSR_EDIT
 } UIState;
 
 // Playback menu items (SEQ mode)
@@ -91,6 +92,38 @@ typedef enum {
     TONE_MENU_ITEM_COUNT
 } ToneEditMenuItem;
 
+// ADSR edit menu items
+typedef enum {
+    ADSR_MENU_ATTACK_RATE,
+    ADSR_MENU_ATTACK_EXP,
+    ADSR_MENU_DECAY_RATE,
+    ADSR_MENU_SUSTAIN_LEVEL,
+    ADSR_MENU_SUSTAIN_RATE,
+    ADSR_MENU_SUSTAIN_SIGNED,
+    ADSR_MENU_SUSTAIN_EXP,
+    ADSR_MENU_RELEASE_RATE,
+    ADSR_MENU_RELEASE_EXP,
+    ADSR_MENU_SAVE,
+    ADSR_MENU_CANCEL,
+    ADSR_MENU_ITEM_COUNT
+} AdsrEditMenuItem;
+
+// ADSR parameters structure
+typedef struct {
+    // ADSR1 parameters
+    int attack;              // 0-127
+    int attackExponential;   // 0 or 1
+    int decay;               // 0-15
+    int sustainLevel;        // 0-15
+    
+    // ADSR2 parameters
+    int sustain;             // 0-127 (sustain rate)
+    int sustainSigned;       // 0 or 1
+    int sustainExponential;  // 0 or 1
+    int release;             // 0-31
+    int releaseExponential;  // 0 or 1
+} AdsrParams;
+
 // File entry structure
 typedef struct {
     char name[32];
@@ -141,6 +174,17 @@ int is_paused = 0;
 int pad, oldpad;
 long current_tempo = 120;  // Track current tempo (default 120 BPM)
 int tempo_changed = 0;  // Track if tempo has been modified from original
+
+// Background image support (16-bit TIM, 320x240 split into two primitives)
+#if HAS_BACKGROUND_IMAGE
+int bg_state = 0;       // 0=default, 1=image+text, 2=image only
+TIM_IMAGE bg_tim;       // TIM image structure
+u_short bg_tpage_left;  // Texture page for left 256 pixels
+u_short bg_tpage_right; // Texture page for right 64 pixels (if 320-wide)
+u_short bg_clut;        // CLUT ID (for 8bpp, unused for 16bpp)
+int bg_is_wide;         // 1 if image is wider than 256 pixels (needs dual draw)
+#endif
+
 short reverb_depth_left = 64;
 short reverb_depth_right = 64;
 short reverb_delay = 0;
@@ -173,6 +217,11 @@ int adsr_digit_pos = 0;  // Current digit position (0-3)
 u_short adsr_temp_value = 0;  // Temporary value while editing
 u_short adsr_original_value = 0;  // Original value (for cancel)
 
+// ADSR parameter editing
+int adsr_editor_active = 0;  // Which ADSR being edited: 1=ADSR1, 2=ADSR2
+AdsrParams current_adsr;  // Current ADSR parameters
+AdsrParams original_adsr;  // Original ADSR parameters (for change detection and cancel)
+
 // Hold detection (at 60Hz, 0.5 seconds = 30 frames)
 #define HOLD_THRESHOLD 30
 #define HOLD_REPEAT_RATE 3  // Repeat every 3 frames when held
@@ -190,6 +239,9 @@ void initGraph(void);
 void display(void);
 void initSound(void);
 void processInput(void);
+#if HAS_BACKGROUND_IMAGE
+void drawBackground(void);
+#endif
 void drawUI(void);
 void drawSeqSelect(void);
 void drawVhSelect(void);
@@ -222,6 +274,16 @@ void drawToneEdit(void);
 int isProgramValueChanged(int menu_item);
 int isToneValueChanged(int menu_item);
 
+// ADSR editor functions
+void decodeADSR(u_short adsr1, u_short adsr2, AdsrParams* params);
+void encodeADSR(AdsrParams* params, u_short* adsr1, u_short* adsr2);
+void enterAdsrEdit(int which_adsr);
+void exitAdsrEdit(int save);
+void adjustAdsrValue(int direction, int amount);
+void toggleAdsrValue(void);
+void drawAdsrEdit(void);
+int isAdsrValueChanged(int menu_item);
+
 void initGraph(void)
 {
     ResetGraph(0);
@@ -238,8 +300,8 @@ void initGraph(void)
     }
     
     SetDispMask(1);
-    setRGB0(&draw[0], 60, 20, 40);
-    setRGB0(&draw[1], 60, 20, 40);
+    setRGB0(&draw[0], 111, 0, 66);
+    setRGB0(&draw[1], 111, 0, 66);
     draw[0].isbg = 1;
     draw[1].isbg = 1;
     
@@ -248,10 +310,59 @@ void initGraph(void)
     
     FntLoad(960, 0);
     FntOpen(8, 8, 304, 224, 0, 2048);
+
+// Load TIM background image (supports up to 320x240 16-bit)
+#if HAS_BACKGROUND_IMAGE
+    OpenTIM((u_long*)BG_IMAGE_DATA);
+    ReadTIM(&bg_tim);
+    
+    // Load pixel data to VRAM
+    LoadImage(bg_tim.prect, (u_long*)bg_tim.paddr);
+    DrawSync(0);
+    
+    // Load CLUT if present (8bpp has CLUT, bit 3 set)
+    if (bg_tim.mode & 0x8) {
+        LoadImage(bg_tim.crect, (u_long*)bg_tim.caddr);
+        DrawSync(0);
+        bg_clut = GetClut(bg_tim.crect->x, bg_tim.crect->y);
+    }
+    
+    // Determine if image is wide (> 256 pixels)
+    // For 16-bit: prect->w is pixel width
+    // For 8-bit: prect->w * 2 is pixel width
+    int pixel_width = bg_tim.prect->w;
+    if ((bg_tim.mode & 0x3) == 1) {  // 8-bit mode
+        pixel_width *= 2;
+    }
+    
+    bg_is_wide = (pixel_width > 256) ? 1 : 0;
+    
+    // Get texture page ID for left portion (first 256 pixels)
+    bg_tpage_left = GetTPage(bg_tim.mode & 0x3, 0, 
+                             bg_tim.prect->x, bg_tim.prect->y);
+    
+    // If wide, get texture page for right portion
+    if (bg_is_wide) {
+        // For 16-bit: second page starts at X + 256
+        // For 8-bit: second page starts at X + 128 (VRAM words)
+        int offset = ((bg_tim.mode & 0x3) == 2) ? 256 : 128;
+        bg_tpage_right = GetTPage(bg_tim.mode & 0x3, 0,
+                                  bg_tim.prect->x + offset, bg_tim.prect->y);
+    }
+#endif
 }
 
 void display(void)
 {
+#if HAS_BACKGROUND_IMAGE
+    // Disable background clear when showing image, enable when not
+    if (bg_state > 0) {
+        draw[db].isbg = 0;  // Disable solid color clear
+    } else {
+        draw[db].isbg = 1;  // Enable solid color clear
+    }
+#endif
+    
     DrawSync(0);
     VSync(0);
     PutDispEnv(&disp[db]);
@@ -306,30 +417,33 @@ void playSequence(void)
     current_tempo = 120;
     tempo_changed = 0;  // Mark as unchanged
     
-    // Open VAB header (VH)
-    current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
+    // Check if VAB is already loaded (e.g., from previous play or editing)
+    // If so, reuse it to preserve any edits made in program editor
     if (current_audio.vab_id < 0) {
-        FntPrint("Failed to open VAB header!\n");
-        return;
+        // Open VAB header (VH)
+        current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
+        if (current_audio.vab_id < 0) {
+            FntPrint("Failed to open VAB header!\n");
+            return;
+        }
+        
+        // Transfer VAB body (VB) to SPU
+        if (SsVabTransBody(current_audio.vb_data, current_audio.vab_id) != current_audio.vab_id) {
+            FntPrint("Failed to transfer VAB body!\n");
+            SsVabClose(current_audio.vab_id);
+            current_audio.vab_id = -1;
+            return;
+        }
+        
+        // Wait for transfer to complete
+        SsVabTransCompleted(SS_WAIT_COMPLETED);
     }
-    
-    // Transfer VAB body (VB) to SPU
-    if (SsVabTransBody(current_audio.vb_data, current_audio.vab_id) != current_audio.vab_id) {
-        FntPrint("Failed to transfer VAB body!\n");
-        SsVabClose(current_audio.vab_id);
-        current_audio.vab_id = -1;
-        return;
-    }
-    
-    // Wait for transfer to complete
-    SsVabTransCompleted(SS_WAIT_COMPLETED);
+    // If VAB is already loaded, we reuse it (preserves program edits)
     
     // Open sequence (cast to unsigned long* as required by API)
     current_audio.seq_id = SsSeqOpen((unsigned long*)current_audio.seq_data, current_audio.vab_id);
     if (current_audio.seq_id < 0) {
         FntPrint("Failed to open sequence!\n");
-        SsVabClose(current_audio.vab_id);
-        current_audio.vab_id = -1;
         return;
     }
     
@@ -359,10 +473,8 @@ void stopSequence(void)
         is_playing = 0;
     }
     
-    if (current_audio.vab_id >= 0) {
-        SsVabClose(current_audio.vab_id);
-        current_audio.vab_id = -1;
-    }
+    // Keep VAB loaded so program editing works when stopped
+    // VAB will be closed when changing files or in cleanup
     
     current_audio.seq_id = -1;
     current_tempo = 120;  // Reset tempo to default
@@ -671,6 +783,15 @@ void enterProgramEdit(void)
 {
     // Save return state
     return_state = current_state;
+    
+    // Ensure VAB is loaded (if not already loaded, load it now)
+    if (current_audio.vab_id < 0 && current_audio.vh_data != NULL) {
+        current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
+        if (current_audio.vab_id >= 0) {
+            SsVabTransBody(current_audio.vb_data, current_audio.vab_id);
+            SsVabTransCompleted(SS_WAIT_COMPLETED);
+        }
+    }
     
     // Load VAB header to get master vol/pan
     VabHdr* vab_hdr = (VabHdr*)current_audio.vh_data;
@@ -1060,17 +1181,265 @@ void toggleToneEditMinMax(void)
     }
 }
 
+// ====================
+// ADSR Editor Functions
+// ====================
+
+void decodeADSR(u_short adsr1, u_short adsr2, AdsrParams* params)
+{
+    // Decode ADSR1 (16 bits)
+    // Bit 15: exponential flag
+    // Bits 14-8: attack stored (7 bits) = (127 - attack)
+    // Bits 7-4: decay stored (4 bits) = (15 - decay)
+    // Bits 3-0: sustain level (4 bits)
+    
+    params->attackExponential = (adsr1 & 0x8000) != 0;
+    int stored_attack = (adsr1 >> 8) & 0x7F;
+    params->attack = 127 - stored_attack;
+    int stored_decay = (adsr1 >> 4) & 0x0F;
+    params->decay = 15 - stored_decay;
+    params->sustainLevel = adsr1 & 0x0F;
+    
+    // Decode ADSR2 (16 bits)
+    // Bit 15: sustain exponential flag
+    // Bit 14: signed flag
+    // Bits 13-6: sustain rate stored (7 bits) = (127 - sustain)
+    // Bit 5: release exponential flag
+    // Bits 4-0: release stored (5 bits) = (31 - release)
+    
+    params->sustainExponential = (adsr2 & 0x8000) != 0;
+    params->sustainSigned = (adsr2 & 0x4000) != 0;
+    int stored_sustain = (adsr2 >> 6) & 0x7F;
+    params->sustain = 127 - stored_sustain;
+    params->releaseExponential = (adsr2 & 0x0020) != 0;
+    int stored_release = adsr2 & 0x1F;
+    params->release = 31 - stored_release;
+}
+
+void encodeADSR(AdsrParams* params, u_short* adsr1, u_short* adsr2)
+{
+    // Encode ADSR1
+    int stored_attack = (127 - params->attack) & 0x7F;
+    int stored_decay = (15 - params->decay) & 0x0F;
+    int sustain_level = params->sustainLevel & 0x0F;
+    
+    *adsr1 = (params->attackExponential ? 0x8000 : 0) |
+             (stored_attack << 8) |
+             (stored_decay << 4) |
+             sustain_level;
+    
+    // Encode ADSR2
+    int stored_sustain = (127 - params->sustain) & 0x7F;
+    int stored_release = (31 - params->release) & 0x1F;
+    
+    *adsr2 = (params->sustainExponential ? 0x8000 : 0) |
+             (params->sustainSigned ? 0x4000 : 0) |
+             (stored_sustain << 6) |
+             (params->releaseExponential ? 0x0020 : 0) |
+             stored_release;
+}
+
+void enterAdsrEdit(int which_adsr)
+{
+    adsr_editor_active = which_adsr;
+    
+    // Decode current ADSR values
+    decodeADSR(current_vag_atr.adsr1, current_vag_atr.adsr2, &current_adsr);
+    
+    // Save original for comparison and cancel
+    original_adsr = current_adsr;
+    
+    // Enter ADSR edit state
+    current_state = STATE_ADSR_EDIT;
+    menu_cursor = 0;
+}
+
+void exitAdsrEdit(int save)
+{
+    if (save) {
+        // Encode and save the parameters
+        encodeADSR(&current_adsr, &current_vag_atr.adsr1, &current_vag_atr.adsr2);
+        saveToneData();
+    } else {
+        // Restore original values
+        current_adsr = original_adsr;
+    }
+    
+    // Return to tone edit
+    current_state = STATE_TONE_EDIT;
+    
+    // Set cursor to the ADSR that was being edited
+    if (adsr_editor_active == 1) {
+        menu_cursor = TONE_MENU_ADSR1;
+    } else {
+        menu_cursor = TONE_MENU_ADSR2;
+    }
+}
+
+void adjustAdsrValue(int direction, int amount)
+{
+    int temp_val;
+    u_short temp_adsr1, temp_adsr2;
+    
+    switch (menu_cursor) {
+        case ADSR_MENU_ATTACK_RATE:
+            temp_val = current_adsr.attack + (direction * amount);
+            if (temp_val < 0) temp_val = 0;
+            if (temp_val > 127) temp_val = 127;
+            current_adsr.attack = temp_val;
+            break;
+            
+        case ADSR_MENU_ATTACK_EXP:
+            current_adsr.attackExponential = !current_adsr.attackExponential;
+            break;
+            
+        case ADSR_MENU_DECAY_RATE:
+            temp_val = current_adsr.decay + (direction * amount);
+            if (temp_val < 0) temp_val = 0;
+            if (temp_val > 15) temp_val = 15;
+            current_adsr.decay = temp_val;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_LEVEL:
+            temp_val = current_adsr.sustainLevel + (direction * amount);
+            if (temp_val < 0) temp_val = 0;
+            if (temp_val > 15) temp_val = 15;
+            current_adsr.sustainLevel = temp_val;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_RATE:
+            temp_val = current_adsr.sustain + (direction * amount);
+            if (temp_val < 0) temp_val = 0;
+            if (temp_val > 127) temp_val = 127;
+            current_adsr.sustain = temp_val;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_SIGNED:
+            current_adsr.sustainSigned = !current_adsr.sustainSigned;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_EXP:
+            current_adsr.sustainExponential = !current_adsr.sustainExponential;
+            break;
+            
+        case ADSR_MENU_RELEASE_RATE:
+            temp_val = current_adsr.release + (direction * amount);
+            if (temp_val < 0) temp_val = 0;
+            if (temp_val > 31) temp_val = 31;
+            current_adsr.release = temp_val;
+            break;
+            
+        case ADSR_MENU_RELEASE_EXP:
+            current_adsr.releaseExponential = !current_adsr.releaseExponential;
+            break;
+            
+        case ADSR_MENU_SAVE:
+        case ADSR_MENU_CANCEL:
+            // No adjustment for action items
+            break;
+    }
+    
+    // Apply changes immediately for preview
+    if (menu_cursor < ADSR_MENU_SAVE) {
+        encodeADSR(&current_adsr, &temp_adsr1, &temp_adsr2);
+        current_vag_atr.adsr1 = temp_adsr1;
+        current_vag_atr.adsr2 = temp_adsr2;
+        saveToneData();
+    }
+}
+
+void toggleAdsrValue(void)
+{
+    switch (menu_cursor) {
+        case ADSR_MENU_ATTACK_RATE:
+            current_adsr.attack = (current_adsr.attack == 127) ? 0 : 127;
+            break;
+            
+        case ADSR_MENU_ATTACK_EXP:
+            current_adsr.attackExponential = !current_adsr.attackExponential;
+            break;
+            
+        case ADSR_MENU_DECAY_RATE:
+            current_adsr.decay = (current_adsr.decay == 15) ? 0 : 15;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_LEVEL:
+            current_adsr.sustainLevel = (current_adsr.sustainLevel == 15) ? 0 : 15;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_RATE:
+            current_adsr.sustain = (current_adsr.sustain == 127) ? 0 : 127;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_SIGNED:
+            current_adsr.sustainSigned = !current_adsr.sustainSigned;
+            break;
+            
+        case ADSR_MENU_SUSTAIN_EXP:
+            current_adsr.sustainExponential = !current_adsr.sustainExponential;
+            break;
+            
+        case ADSR_MENU_RELEASE_RATE:
+            current_adsr.release = (current_adsr.release == 31) ? 0 : 31;
+            break;
+            
+        case ADSR_MENU_RELEASE_EXP:
+            current_adsr.releaseExponential = !current_adsr.releaseExponential;
+            break;
+    }
+    
+    // Apply changes immediately
+    if (menu_cursor < ADSR_MENU_SAVE) {
+        u_short temp_adsr1, temp_adsr2;
+        encodeADSR(&current_adsr, &temp_adsr1, &temp_adsr2);
+        current_vag_atr.adsr1 = temp_adsr1;
+        current_vag_atr.adsr2 = temp_adsr2;
+        saveToneData();
+    }
+}
+
+int isAdsrValueChanged(int menu_item)
+{
+    switch (menu_item) {
+        case ADSR_MENU_ATTACK_RATE:
+            return current_adsr.attack != original_adsr.attack;
+        case ADSR_MENU_ATTACK_EXP:
+            return current_adsr.attackExponential != original_adsr.attackExponential;
+        case ADSR_MENU_DECAY_RATE:
+            return current_adsr.decay != original_adsr.decay;
+        case ADSR_MENU_SUSTAIN_LEVEL:
+            return current_adsr.sustainLevel != original_adsr.sustainLevel;
+        case ADSR_MENU_SUSTAIN_RATE:
+            return current_adsr.sustain != original_adsr.sustain;
+        case ADSR_MENU_SUSTAIN_SIGNED:
+            return current_adsr.sustainSigned != original_adsr.sustainSigned;
+        case ADSR_MENU_SUSTAIN_EXP:
+            return current_adsr.sustainExponential != original_adsr.sustainExponential;
+        case ADSR_MENU_RELEASE_RATE:
+            return current_adsr.release != original_adsr.release;
+        case ADSR_MENU_RELEASE_EXP:
+            return current_adsr.releaseExponential != original_adsr.releaseExponential;
+        default:
+            return 0;
+    }
+}
+
 void processInput(void)
 {
     pad = PadRead(0);
     
     // Global controls that work in all states
     
-    // Select button - Enter program edit (only on initial press, not while held)
+    // Select button behavior in playback states
     if (pad & PADselect && !(oldpad & PADselect)) {
-        if (current_audio.vab_id >= 0 && 
-            (current_state == STATE_PLAYBACK || current_state == STATE_VAB_PLAYBACK)) {
-            enterProgramEdit();
+        if (current_state == STATE_PLAYBACK || current_state == STATE_VAB_PLAYBACK) {
+			#if HAS_BACKGROUND_IMAGE
+						// If background image present, Select toggles background
+						bg_state = (bg_state + 1) % 3;  // Cycle 0->1->2->0
+			#else
+						// No background image, Select enters program edit
+						enterProgramEdit();
+			#endif
         }
     }
     
@@ -1140,6 +1509,11 @@ void processInput(void)
                 current_state = STATE_VAB_VH_SELECT;
                 cursor = 0;
             }
+			#if HAS_BACKGROUND_IMAGE
+						if (pad & PADselect && !(oldpad & PADselect)) { // Select - Toggle background
+							bg_state = (bg_state + 1) % 3;  // Cycle 0->1->2->0
+						}
+			#endif
             break;
             
         case STATE_VH_SELECT:
@@ -1153,6 +1527,12 @@ void processInput(void)
             }
             if (pad & PADRdown && !(oldpad & PADRdown)) { // X button
                 selected_vh = cursor;
+                
+                // Close previously loaded VAB if any (changing to new file)
+                if (current_audio.vab_id >= 0) {
+                    SsVabClose(current_audio.vab_id);
+                    current_audio.vab_id = -1;
+                }
                 
                 // Set up audio file structure
                 current_audio.seq_data = seq_files[selected_seq].data;
@@ -1172,6 +1552,11 @@ void processInput(void)
                 current_state = STATE_PLAYBACK;
             }
             if (pad & PADRright && !(oldpad & PADRright)) { // Circle button
+                // Going back to SEQ select - close VAB as user may select different SEQ
+                if (current_audio.vab_id >= 0) {
+                    SsVabClose(current_audio.vab_id);
+                    current_audio.vab_id = -1;
+                }
                 current_state = STATE_SEQ_SELECT;
                 cursor = selected_seq;
             }
@@ -1340,6 +1725,12 @@ void processInput(void)
             if (pad & PADRdown && !(oldpad & PADRdown)) { // X button
                 selected_vh = cursor;
                 
+                // Close previously loaded VAB if any (changing to new file)
+                if (current_audio.vab_id >= 0) {
+                    SsVabClose(current_audio.vab_id);
+                    current_audio.vab_id = -1;
+                }
+                
                 // Set up audio file structure for VAB mode
                 current_audio.vh_data = vh_files[selected_vh].data;
                 current_audio.vb_data = vb_files[selected_vh];
@@ -1382,6 +1773,11 @@ void processInput(void)
                 current_state = STATE_VAB_PLAYBACK;
             }
             if (pad & PADRright && !(oldpad & PADRright)) { // Circle button - Back to SEQ select
+                // Close VAB if any (going back to SEQ select)
+                if (current_audio.vab_id >= 0) {
+                    SsVabClose(current_audio.vab_id);
+                    current_audio.vab_id = -1;
+                }
                 current_state = STATE_SEQ_SELECT;
                 cursor = 0;
                 vab_mode = 0;
@@ -1650,98 +2046,9 @@ void processInput(void)
             break;
             
         case STATE_TONE_EDIT:
-            // Check if we're in ADSR editing mode
-            if (adsr_editing > 0) {
-                // ADSR HEX EDITING MODE
-                // Skip all inputs if Select is held (layer modifier)
-                if (!select_layer_active) {
-                    // Circle - Cancel editing
-                if (pad & PADRright && !(oldpad & PADRright)) {
-                    // Restore original value
-                    if (adsr_editing == 1) {
-                        current_vag_atr.adsr1 = adsr_original_value;
-                    } else {
-                        current_vag_atr.adsr2 = adsr_original_value;
-                    }
-                    adsr_editing = 0;
-                    adsr_digit_pos = 0;
-                }
-                
-                // X - Confirm editing
-                if (pad & PADRdown && !(oldpad & PADRdown)) {
-                    // Save the edited value
-                    if (adsr_editing == 1) {
-                        current_vag_atr.adsr1 = adsr_temp_value;
-                    } else {
-                        current_vag_atr.adsr2 = adsr_temp_value;
-                    }
-                    saveToneData();
-                    adsr_editing = 0;
-                    adsr_digit_pos = 0;
-                }
-                
-                // Left/Right - Navigate digits
-                if (pad & PADLleft && !(oldpad & PADLleft)) {
-                    adsr_digit_pos--;
-                    if (adsr_digit_pos < 0) adsr_digit_pos = 3;
-                }
-                if (pad & PADLright && !(oldpad & PADLright)) {
-                    adsr_digit_pos++;
-                    if (adsr_digit_pos > 3) adsr_digit_pos = 0;
-                }
-                
-                // Up/Down - Adjust digit value with hold detection
-                if (pad & PADLup) {
-                    hold_counter_up++;
-                    if (!(oldpad & PADLup)) {
-                        // Increase digit value
-                        int shift = (3 - adsr_digit_pos) * 4;
-                        int digit = (adsr_temp_value >> shift) & 0xF;
-                        digit = (digit + 1) & 0xF;  // Wrap at 0xF
-                        adsr_temp_value = (adsr_temp_value & ~(0xF << shift)) | (digit << shift);
-                        hold_counter_up = 0;
-                        hold_active_up = 0;
-                    } else if (hold_counter_up >= HOLD_THRESHOLD && !hold_active_up) {
-                        hold_active_up = 1;
-                    } else if (hold_active_up && (hold_counter_up % HOLD_REPEAT_RATE == 0)) {
-                        int shift = (3 - adsr_digit_pos) * 4;
-                        int digit = (adsr_temp_value >> shift) & 0xF;
-                        digit = (digit + 1) & 0xF;
-                        adsr_temp_value = (adsr_temp_value & ~(0xF << shift)) | (digit << shift);
-                    }
-                } else {
-                    hold_counter_up = 0;
-                    hold_active_up = 0;
-                }
-                
-                if (pad & PADLdown) {
-                    hold_counter_down++;
-                    if (!(oldpad & PADLdown)) {
-                        // Decrease digit value
-                        int shift = (3 - adsr_digit_pos) * 4;
-                        int digit = (adsr_temp_value >> shift) & 0xF;
-                        digit = (digit - 1) & 0xF;  // Wrap at 0xF
-                        adsr_temp_value = (adsr_temp_value & ~(0xF << shift)) | (digit << shift);
-                        hold_counter_down = 0;
-                        hold_active_down = 0;
-                    } else if (hold_counter_down >= HOLD_THRESHOLD && !hold_active_down) {
-                        hold_active_down = 1;
-                    } else if (hold_active_down && (hold_counter_down % HOLD_REPEAT_RATE == 0)) {
-                        int shift = (3 - adsr_digit_pos) * 4;
-                        int digit = (adsr_temp_value >> shift) & 0xF;
-                        digit = (digit - 1) & 0xF;
-                        adsr_temp_value = (adsr_temp_value & ~(0xF << shift)) | (digit << shift);
-                    }
-                } else {
-                    hold_counter_down = 0;
-                    hold_active_down = 0;
-                }
-                // End of ADSR editing mode - closing select_layer_active check
-                }
-            } else {
-                // NORMAL NAVIGATION MODE
-                
-                // Select+L1/R1 combos work when Select is held (NOT wrapped)
+            // NORMAL NAVIGATION MODE
+            
+            // Select+L1/R1 combos work when Select is held (NOT wrapped)
                 if (pad & PADselect) {
                     if (pad & PADL1 && !(oldpad & PADL1)) {
                         // Previous program
@@ -1818,18 +2125,12 @@ void processInput(void)
                     hold_active_down = 0;
                 }
                 
-                // X button - Enter ADSR edit mode if on ADSR1 or ADSR2
+                // X button - Enter ADSR parameter editor if on ADSR1 or ADSR2
                 if (pad & PADRdown && !(oldpad & PADRdown)) {
                     if (menu_cursor == TONE_MENU_ADSR1) {
-                        adsr_editing = 1;
-                        adsr_digit_pos = 0;
-                        adsr_temp_value = current_vag_atr.adsr1;
-                        adsr_original_value = current_vag_atr.adsr1;
+                        enterAdsrEdit(1);  // Edit ADSR1
                     } else if (menu_cursor == TONE_MENU_ADSR2) {
-                        adsr_editing = 2;
-                        adsr_digit_pos = 0;
-                        adsr_temp_value = current_vag_atr.adsr2;
-                        adsr_original_value = current_vag_atr.adsr2;
+                        enterAdsrEdit(2);  // Edit ADSR2
                     }
                 }
                 
@@ -1899,6 +2200,129 @@ void processInput(void)
                         if (oldpad & PADRup) {
                             stopNote();
                         }
+                    }
+                }
+            
+            break;
+            
+        case STATE_ADSR_EDIT:
+            // If Select is held, skip all normal inputs (layer modifier)
+            if (!select_layer_active) {
+                // Circle - Cancel and exit
+                if (pad & PADRright && !(oldpad & PADRright)) {
+                    exitAdsrEdit(0);  // Don't save
+                }
+                
+                // D-Pad Up/Down - Navigate menu with hold detection
+                if (pad & PADLup) {
+                    hold_counter_up++;
+                    if (!(oldpad & PADLup)) {
+                        menu_cursor--;
+                        if (menu_cursor < 0) menu_cursor = ADSR_MENU_ITEM_COUNT - 1;
+                        hold_counter_up = 0;
+                        hold_active_up = 0;
+                    } else if (hold_counter_up >= HOLD_THRESHOLD && !hold_active_up) {
+                        hold_active_up = 1;
+                    } else if (hold_active_up && (hold_counter_up % HOLD_REPEAT_RATE == 0)) {
+                        menu_cursor--;
+                        if (menu_cursor < 0) menu_cursor = ADSR_MENU_ITEM_COUNT - 1;
+                    }
+                } else {
+                    hold_counter_up = 0;
+                    hold_active_up = 0;
+                }
+                
+                if (pad & PADLdown) {
+                    hold_counter_down++;
+                    if (!(oldpad & PADLdown)) {
+                        menu_cursor++;
+                        if (menu_cursor >= ADSR_MENU_ITEM_COUNT) menu_cursor = 0;
+                        hold_counter_down = 0;
+                        hold_active_down = 0;
+                    } else if (hold_counter_down >= HOLD_THRESHOLD && !hold_active_down) {
+                        hold_active_down = 1;
+                    } else if (hold_active_down && (hold_counter_down % HOLD_REPEAT_RATE == 0)) {
+                        menu_cursor++;
+                        if (menu_cursor >= ADSR_MENU_ITEM_COUNT) menu_cursor = 0;
+                    }
+                } else {
+                    hold_counter_down = 0;
+                    hold_active_down = 0;
+                }
+                
+                // X button - Execute action (Save or Cancel)
+                if (pad & PADRdown && !(oldpad & PADRdown)) {
+                    if (menu_cursor == ADSR_MENU_SAVE) {
+                        exitAdsrEdit(1);  // Save
+                    } else if (menu_cursor == ADSR_MENU_CANCEL) {
+                        exitAdsrEdit(0);  // Don't save
+                    }
+                }
+                
+                // Square - Toggle min/max or boolean values
+                if (pad & PADRleft && !(oldpad & PADRleft)) {
+                    if (menu_cursor < ADSR_MENU_SAVE) {
+                        toggleAdsrValue();
+                    }
+                }
+                
+                // L1 - Decrease by 10
+                if (pad & PADL1 && !(oldpad & PADL1)) {
+                    if (menu_cursor < ADSR_MENU_SAVE) {
+                        adjustAdsrValue(-1, 10);
+                    }
+                }
+                
+                // R1 - Increase by 10
+                if (pad & PADR1 && !(oldpad & PADR1)) {
+                    if (menu_cursor < ADSR_MENU_SAVE) {
+                        adjustAdsrValue(1, 10);
+                    }
+                }
+                
+                // D-Pad Left/Right with hold detection
+                if (pad & PADLleft) {
+                    hold_counter_left++;
+                    if (!(oldpad & PADLleft)) {
+                        adjustAdsrValue(-1, 1);
+                        hold_counter_left = 0;
+                        hold_active_left = 0;
+                    } else if (hold_counter_left >= HOLD_THRESHOLD && !hold_active_left) {
+                        hold_active_left = 1;
+                    } else if (hold_active_left && (hold_counter_left % HOLD_REPEAT_RATE == 0)) {
+                        adjustAdsrValue(-1, 1);
+                    }
+                } else {
+                    hold_counter_left = 0;
+                    hold_active_left = 0;
+                }
+                
+                if (pad & PADLright) {
+                    hold_counter_right++;
+                    if (!(oldpad & PADLright)) {
+                        adjustAdsrValue(1, 1);
+                        hold_counter_right = 0;
+                        hold_active_right = 0;
+                    } else if (hold_counter_right >= HOLD_THRESHOLD && !hold_active_right) {
+                        hold_active_right = 1;
+                    } else if (hold_active_right && (hold_counter_right % HOLD_REPEAT_RATE == 0)) {
+                        adjustAdsrValue(1, 1);
+                    }
+                } else {
+                    hold_counter_right = 0;
+                    hold_active_right = 0;
+                }
+            }
+            
+            // Triangle - Play note in VAB mode ALWAYS works
+            if (vab_mode) {
+                if (pad & PADRup) {
+                    if (!(oldpad & PADRup)) {
+                        playNote();
+                    }
+                } else {
+                    if (oldpad & PADRup) {
+                        stopNote();
                     }
                 }
             }
@@ -2048,8 +2472,8 @@ void drawPlayback(void)
     
     FntPrint("\n=== CONTROLS ===\n");
     FntPrint("X: Select\n");
-    FntPrint("Triangle: Toggle Play\n");
-    FntPrint("Start: Pause\n");
+    FntPrint("Triangle: Play/Stop\n");
+    FntPrint("Start: Toggle Pause\n");
     FntPrint("L/R:-1/+1 L1/R1:-10+10\n");
     FntPrint("Square: Min/Max\n");
     FntPrint("Circle: Back\n");
@@ -2380,49 +2804,19 @@ void drawToneEdit(void)
                  isToneValueChanged(TONE_MENU_PBMAX) ? " !" : "");
     }
     
-    // ADSR1 - Show with highlighted digit if editing
+    // ADSR1 - Press X to enter parameter editor
     if (menu_cursor == TONE_MENU_ADSR1) {
-        if (adsr_editing == 1) {
-            // Editing mode - show with highlighted digit
-            FntPrint("> ADSR1: 0x");
-            int i;
-            for (i = 0; i < 4; i++) {
-                int digit = (adsr_temp_value >> ((3 - i) * 4)) & 0xF;
-                if (i == adsr_digit_pos) {
-                    FntPrint("[%X]", digit);
-                } else {
-                    FntPrint("%X", digit);
-                }
-            }
-            FntPrint("%s\n", isToneValueChanged(TONE_MENU_ADSR1) ? " !" : "");
-        } else {
-            FntPrint("> ADSR1: 0x%04X (X)%s\n", current_vag_atr.adsr1,
-                     isToneValueChanged(TONE_MENU_ADSR1) ? " !" : "");
-        }
+        FntPrint("> ADSR1: 0x%04X (X:Edit)%s\n", current_vag_atr.adsr1,
+                 isToneValueChanged(TONE_MENU_ADSR1) ? " !" : "");
     } else {
         FntPrint("  ADSR1: 0x%04X%s\n", current_vag_atr.adsr1,
                  isToneValueChanged(TONE_MENU_ADSR1) ? " !" : "");
     }
     
-    // ADSR2 - Show with highlighted digit if editing
+    // ADSR2 - Press X to enter parameter editor
     if (menu_cursor == TONE_MENU_ADSR2) {
-        if (adsr_editing == 2) {
-            // Editing mode - show with highlighted digit
-            FntPrint("> ADSR2: 0x");
-            int i;
-            for (i = 0; i < 4; i++) {
-                int digit = (adsr_temp_value >> ((3 - i) * 4)) & 0xF;
-                if (i == adsr_digit_pos) {
-                    FntPrint("[%X]", digit);
-                } else {
-                    FntPrint("%X", digit);
-                }
-            }
-            FntPrint("%s\n", isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
-        } else {
-            FntPrint("> ADSR2: 0x%04X (X)%s\n", current_vag_atr.adsr2,
-                     isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
-        }
+        FntPrint("> ADSR2: 0x%04X (X:Edit)%s\n", current_vag_atr.adsr2,
+                 isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
     } else {
         FntPrint("  ADSR2: 0x%04X%s\n", current_vag_atr.adsr2,
                  isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
@@ -2436,17 +2830,248 @@ void drawToneEdit(void)
         if (vab_mode) {
             FntPrint("Triangle: Play\n");
             FntPrint("L2/R2: Note +/-\n");
+			FntPrint("SEL+L1/R1: Program +/-\n");
         } else {
             FntPrint("Triangle: Play/Stop\n");
             FntPrint("Start: Pause\n");
         }
-        FntPrint("X: Edit ADSR\n");
         FntPrint("Circle: Back\n");
+    }
+}
+
+void drawAdsrEdit(void)
+{
+    FntPrint("\n");
+    FntPrint("=== ADSR EDIT ===\n\n");
+    
+    // Display current hex values
+    u_short temp_adsr1, temp_adsr2;
+    encodeADSR(&current_adsr, &temp_adsr1, &temp_adsr2);
+    FntPrint("ADSR1: 0x%04X\n", temp_adsr1);
+    FntPrint("ADSR2: 0x%04X\n\n", temp_adsr2);
+    
+    FntPrint("=== PARAMETERS ===\n");
+    
+    // Attack Rate
+    if (menu_cursor == ADSR_MENU_ATTACK_RATE) {
+        FntPrint("> ATTACK RATE: %d%s\n", current_adsr.attack,
+                 isAdsrValueChanged(ADSR_MENU_ATTACK_RATE) ? " !" : "");
+    } else {
+        FntPrint("  ATTACK RATE: %d%s\n", current_adsr.attack,
+                 isAdsrValueChanged(ADSR_MENU_ATTACK_RATE) ? " !" : "");
+    }
+    
+    // Attack Exponential
+    if (menu_cursor == ADSR_MENU_ATTACK_EXP) {
+        FntPrint("> ATTACK EXP: %s%s\n", current_adsr.attackExponential ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_ATTACK_EXP) ? " !" : "");
+    } else {
+        FntPrint("  ATTACK EXP: %s%s\n", current_adsr.attackExponential ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_ATTACK_EXP) ? " !" : "");
+    }
+    
+    // Decay Rate
+    if (menu_cursor == ADSR_MENU_DECAY_RATE) {
+        FntPrint("> DECAY RATE: %d%s\n", current_adsr.decay,
+                 isAdsrValueChanged(ADSR_MENU_DECAY_RATE) ? " !" : "");
+    } else {
+        FntPrint("  DECAY RATE: %d%s\n", current_adsr.decay,
+                 isAdsrValueChanged(ADSR_MENU_DECAY_RATE) ? " !" : "");
+    }
+    
+    // Sustain Level
+    if (menu_cursor == ADSR_MENU_SUSTAIN_LEVEL) {
+        FntPrint("> SUSTAIN LEVEL: %d%s\n", current_adsr.sustainLevel,
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_LEVEL) ? " !" : "");
+    } else {
+        FntPrint("  SUSTAIN LEVEL: %d%s\n", current_adsr.sustainLevel,
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_LEVEL) ? " !" : "");
+    }
+    
+    // Sustain Rate
+    if (menu_cursor == ADSR_MENU_SUSTAIN_RATE) {
+        FntPrint("> SUSTAIN RATE: %d%s\n", current_adsr.sustain,
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_RATE) ? " !" : "");
+    } else {
+        FntPrint("  SUSTAIN RATE: %d%s\n", current_adsr.sustain,
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_RATE) ? " !" : "");
+    }
+    
+    // Sustain Signed
+    if (menu_cursor == ADSR_MENU_SUSTAIN_SIGNED) {
+        FntPrint("> SUSTAIN SIGN: %s%s\n", current_adsr.sustainSigned ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_SIGNED) ? " !" : "");
+    } else {
+        FntPrint("  SUSTAIN SIGN: %s%s\n", current_adsr.sustainSigned ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_SIGNED) ? " !" : "");
+    }
+    
+    // Sustain Exponential
+    if (menu_cursor == ADSR_MENU_SUSTAIN_EXP) {
+        FntPrint("> SUSTAIN EXP: %s%s\n", current_adsr.sustainExponential ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_EXP) ? " !" : "");
+    } else {
+        FntPrint("  SUSTAIN EXP: %s%s\n", current_adsr.sustainExponential ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_EXP) ? " !" : "");
+    }
+    
+    // Release Rate
+    if (menu_cursor == ADSR_MENU_RELEASE_RATE) {
+        FntPrint("> RELEASE RATE: %d%s\n", current_adsr.release,
+                 isAdsrValueChanged(ADSR_MENU_RELEASE_RATE) ? " !" : "");
+    } else {
+        FntPrint("  RELEASE RATE: %d%s\n", current_adsr.release,
+                 isAdsrValueChanged(ADSR_MENU_RELEASE_RATE) ? " !" : "");
+    }
+    
+    // Release Exponential
+    if (menu_cursor == ADSR_MENU_RELEASE_EXP) {
+        FntPrint("> RELEASE EXP: %s%s\n", current_adsr.releaseExponential ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_RELEASE_EXP) ? " !" : "");
+    } else {
+        FntPrint("  RELEASE EXP: %s%s\n", current_adsr.releaseExponential ? "ON" : "OFF",
+                 isAdsrValueChanged(ADSR_MENU_RELEASE_EXP) ? " !" : "");
+    }
+    
+    FntPrint("\n");
+    
+    // Save option
+    if (menu_cursor == ADSR_MENU_SAVE) {
+        FntPrint("> SAVE\n");
+    } else {
+        FntPrint("  SAVE\n");
+    }
+    
+    // Cancel option
+    if (menu_cursor == ADSR_MENU_CANCEL) {
+        FntPrint("> CANCEL\n");
+    } else {
+        FntPrint("  CANCEL\n");
+    }
+    
+    FntPrint("\n=== CONTROLS ===\n");
+    if (vab_mode) {
+        FntPrint("Triangle: Play\n");
+        FntPrint("L2/R2: Note +/-\n");
+    }
+    FntPrint("Circle: Cancel\n");
+}
+
+// In drawBackground() - Fix UV coordinates for 320x240:
+void drawBackground(void)
+{
+    if (bg_state == 0) return;
+    
+    // Determine pixel dimensions
+    int pixel_width = bg_tim.prect->w;
+    int pixel_height = bg_tim.prect->h;
+    
+    if ((bg_tim.mode & 0x3) == 1) {  // 8-bit mode: VRAM width * 2 = pixel width
+        pixel_width *= 2;
+    }
+    
+    if (!bg_is_wide) {
+        // Standard single primitive for images <= 256 pixels wide
+        POLY_FT4 bg_poly;
+        
+        SetPolyFT4(&bg_poly);
+        setRGB0(&bg_poly, 128, 128, 128);
+        
+        // Screen coordinates: stretch to fullscreen
+        setXY4(&bg_poly, 
+               0, 0,
+               SCREENXRES, 0,
+               0, SCREENYRES,
+               SCREENXRES, SCREENYRES);
+        
+        // UV coordinates: full texture
+        int uvw = (pixel_width > 255) ? 255 : pixel_width;
+        int uvh = (pixel_height > 255) ? 255 : pixel_height;
+        
+        setUV4(&bg_poly,
+               0, 0,
+               uvw, 0,
+               0, uvh,
+               uvw, uvh);
+        
+        bg_poly.tpage = bg_tpage_left;
+        if (bg_tim.mode & 0x8) {  // Has CLUT
+            bg_poly.clut = bg_clut;
+        }
+        
+        DrawPrim(&bg_poly);
+    }
+    else {
+        // Wide image (> 256 pixels): draw two primitives side-by-side
+        POLY_FT4 bg_poly_left, bg_poly_right;
+        
+        // LEFT PRIMITIVE: First 256 pixels (0-255)
+        SetPolyFT4(&bg_poly_left);
+        setRGB0(&bg_poly_left, 128, 128, 128);
+        
+        // Screen coordinates: left portion (0-256)
+        setXY4(&bg_poly_left,
+               0, 0,
+               256, 0,
+               0, SCREENYRES,
+               256, SCREENYRES);
+        
+        // UV coordinates: full 256 pixels from left texture page
+        int uvh = (pixel_height > 255) ? 255 : pixel_height;
+        
+        setUV4(&bg_poly_left,
+               0, 0,
+               255, 0,
+               0, uvh,
+               255, uvh);
+        
+        bg_poly_left.tpage = bg_tpage_left;
+        if (bg_tim.mode & 0x8) {
+            bg_poly_left.clut = bg_clut;
+        }
+        
+        DrawPrim(&bg_poly_left);
+        
+        // RIGHT PRIMITIVE: Remaining pixels (256-319 = 64 pixels)
+        SetPolyFT4(&bg_poly_right);
+        setRGB0(&bg_poly_right, 128, 128, 128);
+        
+        // Screen coordinates: right portion (256-320)
+        setXY4(&bg_poly_right,
+               256, 0,
+               SCREENXRES, 0,
+               256, SCREENYRES,
+               SCREENXRES, SCREENYRES);
+        
+        // UV coordinates: remaining pixels from right texture page
+        // For 320-wide image, this is 64 pixels (0-63 in the second page)
+        int uvw_right = pixel_width - 256;
+        if (uvw_right > 255) uvw_right = 255;  // Safety clamp
+        
+        setUV4(&bg_poly_right,
+               0, 0,
+               uvw_right, 0,
+               0, uvh,
+               uvw_right, uvh);
+        
+        bg_poly_right.tpage = bg_tpage_right;
+        if (bg_tim.mode & 0x8) {
+            bg_poly_right.clut = bg_clut;
+        }
+        
+        DrawPrim(&bg_poly_right);
     }
 }
 
 void drawUI(void)
 {
+	#if HAS_BACKGROUND_IMAGE
+		// Don't draw UI text when in full image mode (bg_state == 2)
+		if (bg_state == 2) {
+			return;
+		}
+	#endif
+    
     switch (current_state) {
         case STATE_SEQ_SELECT:
             drawSeqSelect();
@@ -2469,6 +3094,9 @@ void drawUI(void)
         case STATE_TONE_EDIT:
             drawToneEdit();
             break;
+        case STATE_ADSR_EDIT:
+            drawAdsrEdit();
+            break;
     }
 }
 
@@ -2486,9 +3114,22 @@ int main(void)
     while (1)
     {
         processInput();
-        drawUI();
         
-        FntFlush(-1);
+		#if HAS_BACKGROUND_IMAGE
+				drawBackground();  // Draw background image first if enabled
+		#endif
+				
+				drawUI();
+				
+		#if HAS_BACKGROUND_IMAGE
+				// Only flush font buffer when not in full image mode
+				if (bg_state != 2) {
+					FntFlush(-1);
+				}
+		#else
+				FntFlush(-1);
+		#endif
+        
         display();
         
         //ONLY USE THIS COMMAND IF NOTICK IS ENABLED

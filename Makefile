@@ -26,8 +26,8 @@ SEQ_FILES := $(wildcard ./SEQ/*.seq)
 VH_FILES := $(wildcard ./SOUNDBANK/VH/*.vh)
 
 # Limit to maximum 5 files each
-SEQ_FILES := $(wordlist 1,5,$(SEQ_FILES))
-VH_FILES := $(wordlist 1,5,$(VH_FILES))
+SEQ_FILES := $(wordlist 1,15,$(SEQ_FILES))
+VH_FILES := $(wordlist 1,15,$(VH_FILES))
 
 # Check minimum requirement (at least 1 of each)
 ifeq ($(words $(SEQ_FILES)),0)
@@ -43,8 +43,24 @@ VB_FILES := $(patsubst ./SOUNDBANK/VH/%.vh,./SOUNDBANK/VB/%.vb,$(VH_FILES))
 # Verify VB files exist
 $(foreach vb,$(VB_FILES),$(if $(wildcard $(vb)),,$(error Missing VB file: $(vb))))
 
+# Check for optional background image (16-bit TIM recommended, up to 320x240)
+IMG_FILE := $(wildcard ./IMG/*.tim)
+ifneq ($(IMG_FILE),)
+IMG_FILE := $(word 1,$(IMG_FILE))
+$(info Found background image: $(IMG_FILE))
+$(info Supported: 16-bit TIM up to 320x240 (dual-primitive for 320-wide))
+HAS_IMAGE := 1
+else
+$(info No background image found in ./IMG/ directory (optional))
+HAS_IMAGE := 0
+endif
+
 # Build SRCS list
+ifeq ($(HAS_IMAGE),1)
+SRCS = seq_player.c $(SEQ_FILES) $(VH_FILES) $(VB_FILES) $(IMG_FILE)
+else
 SRCS = seq_player.c $(SEQ_FILES) $(VH_FILES) $(VB_FILES)
+endif
 
 # Debug: show what will be built
 $(info SRCS: $(SRCS))
@@ -62,6 +78,13 @@ $(shell echo "" >> fileconfig.h)
 $(shell echo "// File counts" >> fileconfig.h)
 $(shell echo "#define MAX_SEQ_FILES $(words $(SEQ_FILES))" >> fileconfig.h)
 $(shell echo "#define MAX_VH_FILES $(words $(VH_FILES))" >> fileconfig.h)
+$(shell echo "" >> fileconfig.h)
+$(shell echo "// Background image (16-bit TIM recommended, up to 320x240)" >> fileconfig.h)
+$(shell echo "#define HAS_BACKGROUND_IMAGE $(HAS_IMAGE)" >> fileconfig.h)
+ifeq ($(HAS_IMAGE),1)
+$(shell echo 'extern u_long _binary_IMG_$(basename $(notdir $(IMG_FILE)))_tim_start[];' >> fileconfig.h)
+$(shell echo '#define BG_IMAGE_DATA _binary_IMG_$(basename $(notdir $(IMG_FILE)))_tim_start' >> fileconfig.h)
+endif
 $(shell echo "" >> fileconfig.h)
 $(shell echo "// Extern declarations for SEQ files" >> fileconfig.h)
 $(foreach seq,$(SEQ_FILES),$(shell echo 'extern u_char _binary_SEQ_$(basename $(notdir $(seq)))_seq_start[];' >> fileconfig.h))
@@ -108,6 +131,13 @@ fileconfig.h: Makefile
 	@echo "#define MAX_SEQ_FILES $(words $(SEQ_FILES))" >> $@
 	@echo "#define MAX_VH_FILES $(words $(VH_FILES))" >> $@
 	@echo "" >> $@
+	@echo "// Background image (16-bit TIM recommended, up to 320x240)" >> $@
+	@echo "#define HAS_BACKGROUND_IMAGE $(HAS_IMAGE)" >> $@
+ifeq ($(HAS_IMAGE),1)
+	@echo 'extern u_long _binary_IMG_$(basename $(notdir $(IMG_FILE)))_tim_start[];' >> $@
+	@echo '#define BG_IMAGE_DATA _binary_IMG_$(basename $(notdir $(IMG_FILE)))_tim_start' >> $@
+endif
+	@echo "" >> $@
 	@echo "// Extern declarations for SEQ files" >> $@
 	@$(foreach seq,$(SEQ_FILES),echo 'extern u_char _binary_SEQ_$(basename $(notdir $(seq)))_seq_start[];' >> $@;)
 	@echo "" >> $@
@@ -141,4 +171,4 @@ fileconfig.h: Makefile
 # Make fileconfig.h a prerequisite of all
 all: fileconfig.h
 
-include ../common.mk	
+include ../common.mk
