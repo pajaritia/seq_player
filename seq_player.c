@@ -379,8 +379,9 @@ void initSound(void)
     SsSetTableSize(seq_table, MAX_SEQ_FILES, MAX_VH_FILES);
     
     // Set tick mode to SS_TICK240 for correct tempo (240Hz timing)
-    // SS_TICK60 causes sequences to play too fast
-    SsSetTickMode(SS_TICK240);
+    // SS_TICK60 causes sequences to play too fast, SS_TICK240 seems to have tempo isseus
+	// SFG recommended an arbitrary tickrate of 97
+    SsSetTickMode(97);
     
     // Set master volume
     SsSetMVol(127, 127);
