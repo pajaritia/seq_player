@@ -379,9 +379,8 @@ void initSound(void)
     SsSetTableSize(seq_table, MAX_SEQ_FILES, MAX_VH_FILES);
     
     // Set tick mode to SS_TICK240 for correct tempo (240Hz timing)
-    // SS_TICK60 causes sequences to play too fast, SS_TICK240 seems to have tempo isseus
-	// SFG recommended an arbitrary tickrate of 97
-    SsSetTickMode(97);
+    // SS_TICK60 causes sequences to play too fast
+    SsSetTickMode(SS_TICK240);
     
     // Set master volume
     SsSetMVol(127, 127);
@@ -619,10 +618,10 @@ void playNote(void)
     short tone_to_use;
     
     // Use edit_program if in editor states, otherwise use current_program
-    if (current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT) {
+    if (current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
         program_to_use = edit_program;
-        // In Tone Editor, use the currently selected tone
-        if (current_state == STATE_TONE_EDIT) {
+        // In Tone Editor and ADSR Editor, use the currently selected tone
+        if (current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
             tone_to_use = edit_tone;
         } else {
             tone_to_use = 0;
@@ -652,10 +651,10 @@ void stopNote(void)
     short tone_to_use;
     
     // Use edit_program if in editor states, otherwise use current_program
-    if (current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT) {
+    if (current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
         program_to_use = edit_program;
-        // In Tone Editor, use the currently selected tone
-        if (current_state == STATE_TONE_EDIT) {
+        // In Tone Editor and ADSR Editor, use the currently selected tone
+        if (current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
             tone_to_use = edit_tone;
         } else {
             tone_to_use = 0;
