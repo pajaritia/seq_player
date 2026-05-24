@@ -58,16 +58,16 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 		Delay Rate				"			6				0~127
 		Sustain Level			"			7				0~127
 		Sustain Rate			"			8				0~127
-		Sustain Exp				"			9				0~127
+		Sustain Exp			"			9				0~127
 		Release Rate			"			10				0~127
-		Release Exp				"			11				0~127
+		Release Exp			"			11				0~127
 		Sustain Sign			"			12				0~64=+ 65~127=–
 			*13, 14 are vibrato and portamento messages, not implemented in the PsyQ SDK :(*
-		Reverb type 			16			15			0~9
-		Reverb depth 			16			16			0~127
-		Echo feedback 			16			17			0~127
-		Echo delay time 		16			18			0~127
-		Delay time				16			19			0~127```
+		Reverb type 			16			15				0~9
+		Reverb depth 			16			16				0~127
+		Echo feedback 			16			17				0~127
+		Echo delay time 		16			18				0~127
+		Delay time				16			19				0~127```
 
 ## Functionality
 - Plays .seq files with a selected soundbank, can change soundbank parameters during playback. Some parameters like reverb type will require playback to restart.
