@@ -3675,6 +3675,7 @@ void drawAdsrEdit(void)
     }
     FntPrint("CIRCLE: CANCEL\n");
 }
+#if HAS_BACKGROUND_IMAGE
 
 // In drawBackground() - Fix UV coordinates for 320x240:
 void drawBackground(void)
@@ -3781,6 +3782,7 @@ void drawBackground(void)
         DrawPrim(&bg_poly_right);
     }
 }
+#endif // HAS_BACKGROUND_IMAGE
 
 void drawUI(void)
 {
