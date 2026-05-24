@@ -53,7 +53,7 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 	- NRPN messages
 		```
   		ATTRIBUTE 			Data1 (CC99) 	Data2 (CC98)	Data3 (CC06)
-		Attack Rate			Tone Number		4				0~127
+		Attack Rate		Tone Number		4				0~127
 		Attack Exp				"			5				0~127
 		Delay Rate				"			6				0~127
 		Sustain Level			"			7				0~127
