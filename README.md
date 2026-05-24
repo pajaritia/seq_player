@@ -51,7 +51,8 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 	- Program Volume (CC 7)
 	- Program Pan (CC 10)
 	- NRPN messages
-	  ATTRIBUTE 			Data1 (CC99) 	Data2 (CC98)	Data3 (CC06)
+		```
+  		ATTRIBUTE 			Data1 (CC99) 	Data2 (CC98)	Data3 (CC06)
 		Attack Rate			Tone Number		4				0~127
 		Attack Exp				"			5				0~127
 		Delay Rate				"			6				0~127
@@ -66,7 +67,7 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 		Reverb depth 			16			16			0~127
 		Echo feedback 			16			17			0~127
 		Echo delay time 		16			18			0~127
-		Delay time				16			19			0~127
+		Delay time				16			19			0~127```
 
 ## Functionality
 - Plays .seq files with a selected soundbank, can change soundbank parameters during playback. Some parameters like reverb type will require playback to restart.
