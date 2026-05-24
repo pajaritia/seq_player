@@ -42,8 +42,8 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 - How I tested this (description of my setup):
 	- A SCPH-7501 console connected via the serial port to a RP2040 Zero
  	- The RP2040 Zero is connected via USB to a Windows PC, running version 4.2 of this firmware: https://github.com/Noltari/pico-uart-bridge
-	-I am using `nops /fast /exe seq_player.exe COMport` to upload and run the ps-exe on the console.
-	-A USB MIDI controller connected to the same Windows PC, sending the MIDI messages to the COMport via serial using this program: https://github.com/ezequielabregu/EA-serialmidi-bridge
+  - I am using `nops /fast /exe seq_player.exe COMport` to upload and run the ps-exe on the console.
+  - A USB MIDI controller connected to the same Windows PC, sending the MIDI messages to the COMport via serial using this program: https://github.com/ezequielabregu/EA-serialmidi-bridge
 - List of supported MIDI messages:
 	- Note ON + Velocity
 	- Note OFF + Velocity
