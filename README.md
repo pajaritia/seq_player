@@ -62,7 +62,7 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 		Release Rate			"			10				0~127
 		Release Exp			"			11				0~127
 		Sustain Sign			"			12				0~64=+ 65~127=–
-			*13, 14 are vibrato and portamento messages, not implemented in the PsyQ SDK :(*
+			13, 14 are vibrato and portamento messages, not implemented in the PsyQ SDK :(
 		Reverb type 			16			15				0~9
 		Reverb depth 			16			16				0~127
 		Echo feedback 			16			17				0~127
