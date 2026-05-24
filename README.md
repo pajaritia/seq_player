@@ -52,20 +52,20 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 		- Program Pan (CC 10)
 		- NRPN messages
 		  ATTRIBUTE 			Data1 (CC99) 	Data2 (CC98)	Data3 (CC06)
-			Attack Rate			Tone Number		4			0~127
-			Attack Exp				"			5			0~127
-			Delay Rate				"			6			0~127
-			Sustain Level			"			7			0~127
-			Sustain Rate				"			8			0~127
-			Sustain Exp				"			9			0~127
-			Release Rate				"			10			0~127
-			Release Exp				"			11			0~127
-			Sustain Sign				"			12			0~64=+ 65~127=–
+			Attack Rate			Tone Number		4				0~127
+			Attack Exp				"			5				0~127
+			Delay Rate				"			6				0~127
+			Sustain Level			"			7				0~127
+			Sustain Rate			"			8				0~127
+			Sustain Exp				"			9				0~127
+			Release Rate			"			10				0~127
+			Release Exp				"			11				0~127
+			Sustain Sign			"			12				0~64=+ 65~127=–
 				*13, 14 are vibrato and portamento messages, not implemented in the PsyQ SDK :(*
-			Reverb type 				16			15			0~9
+			Reverb type 			16			15			0~9
 			Reverb depth 			16			16			0~127
 			Echo feedback 			16			17			0~127
-			Echo delay time 			16			18			0~127
+			Echo delay time 		16			18			0~127
 			Delay time				16			19			0~127
 
 ## Functionality
