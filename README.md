@@ -33,7 +33,7 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
 
 ## Serial MIDI implementation:
 - Pressing Start in VAB Mode will open a serial connection that can decode MIDI messages.
-- Baud Rate for the serial connection is hardcoded, can be configured in line 247 of seq_player.c
+- Baud Rate for the serial connection is hardcoded (default 115200), can be configured in line 247 of seq_player.c
 - Requirements:
 	- A Playstation console with a serial connection.
 	- A way to run the ps-exe in the console
@@ -45,35 +45,33 @@ Playstation 1 sound format player (*.seq *.vh *.vb)
   	- A USB MIDI controller connected to the same Windows PC, sending the MIDI messages to the COMport via serial using this program: https://github.com/ezequielabregu/EA-serialmidi-bridge
 - List of supported MIDI messages:
 	- Note ON + Velocity
-	- Note OFF + Velocity
+	- Note OFF
 	- Pitch Bend
 	- Program Volume (CC 7)
 	- Program Pan (CC 10)
-	- NRPN messages
+	- NRPN messages:
 		```
   		ATTRIBUTE 			Data1 (CC99) 	Data2 (CC98)	Data3 (CC06)
-		Attack Rate		Tone Number		4				0~127
-		Attack Exp				"			5				0~127
-		Delay Rate				"			6				0~127
-		Sustain Level			"			7				0~127
+		Attack Rate		Tone Number		4				0-127
+		Attack Exp				"			5				0:Off, >=1:On
+		Decay Rate				"			6				0~15
+		Sustain Level			"			7				0~15
 		Sustain Rate			"			8				0~127
-		Sustain Exp			"			9				0~127
-		Release Rate			"			10				0~127
-		Release Exp			"			11				0~127
-		Sustain Sign			"			12				0~64=+ 65~127=–
-			13, 14 are vibrato and portamento messages, not implemented in the PsyQ SDK :(
+		Sustain Exp			"			9				0:Off >=1:On
+		Release Rate			"			10				0-127
+		Release Exp			"			11				0:Off, >=1:On
+		Sustain Sign			"			12				0~64:+, 65~127:-
+			*13, 14 are vibrato and portamento messages, not implemented in the PsyQ SDK :(* 
 		Reverb type 			16			15				0~9
 		Reverb depth 			16			16				0~127
 		Echo feedback 			16			17				0~127
 		Echo delay time 		16			18				0~127
-		Delay time				16			19				0~127```
-
+		Delay time				16			19				0~127
 ## Functionality
 - Plays .seq files with a selected soundbank, can change soundbank parameters during playback. Some parameters like reverb type will require playback to restart.
 - Can play single notes using data from a soundbank.
 - In both modes the Program Editor can be selected to edit program settings, selecting a tone will open the Tone Editor to edit Tone settings.
 - ADSR values can be edited.
-- Changes are volatile in the RAM, reloading the soundbank may undo any changes. (This may no longer occur, uncertain)
 
 ## Optional features
 - A background image can be provided by placing a 16bpp, 320x240 pixel resolution .TIM image in the IMG directory. (/IMG/image.tim)
