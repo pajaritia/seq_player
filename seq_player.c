@@ -3035,7 +3035,7 @@ void drawPlayback(void)
     FntPrint("\n");
     FntPrint("=== SEQ PLAYER ===\n\n");
     FntPrint("SEQ: %s\n", current_audio.seq_name);
-    FntPrint("VH: %s\n", current_audio.vh_name);
+    FntPrint("VH: %s @%08X sz:%04X\n", current_audio.vh_name, (unsigned int)current_audio.vh_data, (unsigned int)current_audio.vh_size);
     FntPrint("PROGS: %d TONES: %d\n\n", current_audio.num_programs, current_audio.num_tones);
     
     // Determine status
@@ -3165,7 +3165,7 @@ void drawVabPlayback(void)
     
     FntPrint("\n");
     FntPrint("=== VAB PLAYER ===\n\n");
-    FntPrint("VH: %s\n", current_audio.vh_name);
+    FntPrint("VH: %s @%08X sz:%04X\n", current_audio.vh_name, (unsigned int)current_audio.vh_data, (unsigned int)current_audio.vh_size);
     FntPrint("PROGRAMS: %d\n", current_audio.num_programs);
     FntPrint("TONES: %d\n\n", current_audio.num_tones);
     
@@ -3675,8 +3675,8 @@ void drawAdsrEdit(void)
     }
     FntPrint("CIRCLE: CANCEL\n");
 }
-#if HAS_BACKGROUND_IMAGE
 
+#if HAS_BACKGROUND_IMAGE
 // In drawBackground() - Fix UV coordinates for 320x240:
 void drawBackground(void)
 {
