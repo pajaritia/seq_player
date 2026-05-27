@@ -3,6 +3,7 @@
 //
 // Based on nolibgs_hello_worlds SDK
 // Uses libsnd for sequence/VAB playback
+// Uses libsio for Serial MIDI input (VAB mode)
 
 #include <sys/types.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <libgpu.h>
 #include <libsnd.h>
 #include <libspu.h>
+#include <libsio.h>
 
 // Include auto-generated file configuration
 #include "fileconfig.h"
@@ -35,7 +37,7 @@ typedef enum {
     STATE_ADSR_EDIT
 } UIState;
 
-// Playback menu items (SEQ mode)
+// SEQ mode menu items
 typedef enum {
     MENU_PLAY,
     MENU_PAUSE,
@@ -49,7 +51,7 @@ typedef enum {
     MENU_ITEM_COUNT
 } PlaybackMenuItem;
 
-// VAB playback menu items
+// VAB mode menu items
 typedef enum {
     VAB_MENU_NOTE,
     VAB_MENU_PROGRAM,
@@ -61,7 +63,7 @@ typedef enum {
     VAB_MENU_ITEM_COUNT
 } VabPlaybackMenuItem;
 
-// Program edit menu items
+// Program editor menu items
 typedef enum {
     PROG_MENU_PROGRAM_SEL,
     PROG_MENU_NUM_TONES,
@@ -72,11 +74,11 @@ typedef enum {
     PROG_MENU_ITEM_COUNT
 } ProgramEditMenuItem;
 
-// Tone edit menu items
+// Tone editor menu items
 typedef enum {
-    TONE_MENU_PROG,      // Program selector (navigable)
+    TONE_MENU_PROG,
     TONE_MENU_TONE_SEL,
-    TONE_MENU_NOTE_SEL,  // VAB mode only
+    TONE_MENU_NOTE_SEL,
     TONE_MENU_PRIOR,
     TONE_MENU_MODE,
     TONE_MENU_VOL,
@@ -92,7 +94,7 @@ typedef enum {
     TONE_MENU_ITEM_COUNT
 } ToneEditMenuItem;
 
-// ADSR edit menu items
+// ADSR editor menu items
 typedef enum {
     ADSR_MENU_ATTACK_RATE,
     ADSR_MENU_ATTACK_EXP,
@@ -148,9 +150,8 @@ typedef struct {
     u_short num_tones;
 } AudioFile;
 
-// File counts and extern declarations are now in fileconfig.h
+// File definitions are now in fileconfig.h
 // MAX_SEQ_FILES and MAX_VH_FILES are defined there
-// All extern declarations are generated at build time
 
 // File lists - initialized from generated macros
 FileEntry seq_files[MAX_SEQ_FILES] = SEQ_FILES_INIT;
@@ -194,9 +195,23 @@ short reverb_type = 0;
 // VAB mode specific variables
 int vab_mode = 0;  // 0 = SEQ mode, 1 = VAB mode
 short current_note = 60;  // Middle C (MIDI note 60)
-short current_program = 0;  // Program (instrument) number
-short current_voice = -1;  // Voice channel ID (-1 = not playing)
-int note_playing = 0;  // Is note currently playing
+short current_program = 0;  // Program number
+short current_voice = -1;  // Voice channel ID for controller (Triangle) note (-1 = not playing)
+int note_playing = 0;  // Is controller (Triangle) note playing
+
+// MIDI polyphony pool, one slot per simultaneously held MIDI note
+// Kept separate from the controller path so Triangle and MIDI work
+#define MIDI_MAX_VOICES  24   // Polyphony limit; SPU has 24 hardware voices
+
+typedef struct {
+    short note;      // MIDI note number; -1 = slot is free
+    short voice_id;  // SPU voice ID returned by SsUtKeyOn
+    short program;   // Program used when the note was triggered (for KeyOff)
+    short tone;      // Tone used when the note was triggered (for KeyOff)
+} MidiVoice;
+
+MidiVoice midi_voices[MIDI_MAX_VOICES];
+int midi_poly_count = 0;  // Number of currently active MIDI voices
 
 // Program/Tone editing variables
 int edit_program = 0;  // Currently selected program for editing
@@ -211,19 +226,13 @@ u_char vab_master_pan = 64;  // VAB master pan
 u_char original_master_vol = 127;  // Original master volume
 u_char original_master_pan = 64;  // Original master pan
 
-// ADSR hex editing
-int adsr_editing = 0;  // 0=not editing, 1=editing ADSR1, 2=editing ADSR2
-int adsr_digit_pos = 0;  // Current digit position (0-3)
-u_short adsr_temp_value = 0;  // Temporary value while editing
-u_short adsr_original_value = 0;  // Original value (for cancel)
-
 // ADSR parameter editing
 int adsr_editor_active = 0;  // Which ADSR being edited: 1=ADSR1, 2=ADSR2
 AdsrParams current_adsr;  // Current ADSR parameters
 AdsrParams original_adsr;  // Original ADSR parameters (for change detection and cancel)
 
-// Hold detection (at 60Hz, 0.5 seconds = 30 frames)
-#define HOLD_THRESHOLD 30
+
+#define HOLD_THRESHOLD 30  // Hold detection (at 60Hz, 0.5 seconds = 30 frames)
 #define HOLD_REPEAT_RATE 3  // Repeat every 3 frames when held
 int hold_counter_left = 0;
 int hold_counter_right = 0;
@@ -233,6 +242,40 @@ int hold_counter_up = 0;
 int hold_counter_down = 0;
 int hold_active_up = 0;
 int hold_active_down = 0;
+
+// Standard MIDI baud rate
+#define MIDI_BAUD            115200
+// Ring buffer size — MUST be a power of 2 for the & mask trick
+#define MIDI_RX_BUF_SIZE     64
+// How many frames to keep the last MIDI message on screen (~3s at 60 Hz)
+#define MIDI_DISPLAY_FRAMES  180
+
+// Ring buffer written by the SIO ISR, drained by the main loop
+// volatile prevents the compiler from caching head/tail in registers
+static volatile u_char midi_rx_buf[MIDI_RX_BUF_SIZE];
+static volatile int    midi_rx_head = 0;   // ISR advances this
+static volatile int    midi_rx_tail = 0;   // main loop advances this
+
+// MIDI running-status parser (main-loop only, no volatile needed)
+static u_char midi_run_status = 0;
+static u_char midi_pbuf[3];
+static int    midi_pbuf_pos   = 0;
+static int    midi_pbuf_exp   = 0;
+
+// Display state
+int  serial_midi_enabled = 0;
+char midi_last_msg[48]   = "";
+int  midi_msg_timer      = 0;
+
+// Current MIDI pitch bend value (0-127, 64 = center/no bend)
+// Stored so new notes triggered while bent play with bend already applied
+short midi_pitch_bend = 64;
+
+// NRPN accumulator, CC99(MSB)+CC98(LSB) before CC06 fires
+// 0xFF = not yet received
+static u_char midi_nrpn_msb = 0xFF;
+static u_char midi_nrpn_lsb = 0xFF;
+
 
 // Function prototypes
 void initGraph(void);
@@ -283,6 +326,17 @@ void adjustAdsrValue(int direction, int amount);
 void toggleAdsrValue(void);
 void drawAdsrEdit(void);
 int isAdsrValueChanged(int menu_item);
+
+// Serial MIDI functions
+static int  midiMsgLength(u_char status);
+static void sioRxIsr(void);
+void startSerialMidi(void);
+void stopSerialMidi(void);
+void processMidi(void);
+void initMidiVoices(void);
+void midiNoteOn(u_char note, u_char velocity);
+void midiNoteOff(u_char note);
+void midiAllNotesOff(void);
 
 void initGraph(void)
 {
@@ -387,8 +441,9 @@ void initSound(void)
     
     // Start sound system
     SsStart();
-
-	
+    
+    // Initialise MIDI polyphony pool
+    initMidiVoices();
 }
 
 void loadAudioFiles(void)
@@ -417,7 +472,7 @@ void playSequence(void)
     current_tempo = 120;
     tempo_changed = 0;  // Mark as unchanged
     
-    // Check if VAB is already loaded (e.g., from previous play or editing)
+    // Check if VAB is already loaded from previous play or editing
     // If so, reuse it to preserve any edits made in program editor
     if (current_audio.vab_id < 0) {
         // Open VAB header (VH)
@@ -454,8 +509,6 @@ void playSequence(void)
 	SsUtSetReverbType(reverb_type);
 	SsUtReverbOn();
 
-	
-    
     // Play sequence (infinite loop)
     SsSeqPlay(current_audio.seq_id, SSPLAY_PLAY, SSPLAY_INFINITY);
 
@@ -523,6 +576,7 @@ void adjustMenuValue(int direction, int amount)
             tempo_changed = 1;  // Mark as changed
             if (is_playing && current_audio.seq_id >= 0) {
                 if (direction > 0) {
+					//SsSeqSetAccelerando(seq_access_num, tempo, v_time);
                     SsSeqSetAccelerando(current_audio.seq_id, current_tempo, 120);
                 } else {
                     SsSeqSetRitardando(current_audio.seq_id, current_tempo, 120);
@@ -617,7 +671,7 @@ void playNote(void)
     short program_to_use;
     short tone_to_use;
     
-    // Use edit_program if in editor states, otherwise use current_program
+    // Use edit_program if in editor, otherwise use current_program
     if (current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
         program_to_use = edit_program;
         // In Tone Editor and ADSR Editor, use the currently selected tone
@@ -784,7 +838,8 @@ void enterProgramEdit(void)
     // Save return state
     return_state = current_state;
     
-    // Ensure VAB is loaded (if not already loaded, load it now)
+    // Ensure VAB is loaded
+	// if not already loaded, load it now
     if (current_audio.vab_id < 0 && current_audio.vh_data != NULL) {
         current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
         if (current_audio.vab_id >= 0) {
@@ -1424,12 +1479,577 @@ int isAdsrValueChanged(int menu_item)
     }
 }
 
+// Serial MIDI experiment :)
+// Returns the expected byte length for a given MIDI status byte
+// System real-time messages (0xF8-0xFF) are not relevant here
+static int midiMsgLength(u_char status)
+{
+    u_char type = status & 0xF0;
+    // 2-byte messages: Program Change, Channel Pressure
+    if (type == 0xC0 || type == 0xD0) return 2;
+    // 3-byte messages: Note Off, Note On, Poly AT, CC, Pitch Bend
+    if (type == 0x80 || type == 0x90 ||
+        type == 0xA0 || type == 0xB0 || type == 0xE0) return 3;
+    // SysEx / System messages: treat as 1-byte (skip/ignore)
+    return 1;
+}
+
+// SIO1 receive interrupt service routine
+// Drains the hardware RX register into the ring buffer, then clears the IRQ
+// Keep this short, it runs at interrupt level
+static void sioRxIsr(void)
+{
+    // SR_RXRDY is bit 1 of the driver status word
+    while (_sio_control(0, 0, 0) & 0x02) {
+        u_char b = (u_char)_sio_control(0, 4, 0);
+        int nxt = (midi_rx_head + 1) & (MIDI_RX_BUF_SIZE - 1);
+        if (nxt != midi_rx_tail) {      // drop byte only if buffer is full
+            midi_rx_buf[midi_rx_head] = b;
+            midi_rx_head = nxt;
+        }
+    }
+    // Clear interrupt and error flags so the next RX interrupt can fire
+    _sio_control(2, 1, 0);
+}
+
+// Polyphony Voice Pool
+// Reset every slot to "free", called once from initSound()
+void initMidiVoices(void)
+{
+    int i;
+    for (i = 0; i < MIDI_MAX_VOICES; i++) {
+        midi_voices[i].note     = -1;
+        midi_voices[i].voice_id = -1;
+        midi_voices[i].program  = 0;
+        midi_voices[i].tone     = 0;
+    }
+    midi_poly_count = 0;
+}
+
+// Trigger a note from a MIDI NoteOn message
+// velocity is mapped 1-127 → 1-127 straight onto vol_left / vol_right
+// If all MIDI_MAX_VOICES slots are already occupied the oldest voice
+// (slot 0) is stolen, all remaining slots shift down by one
+void midiNoteOn(u_char note, u_char velocity)
+{
+    int i;
+    short program_to_use;
+    short tone_to_use;
+    short new_voice;
+
+    // Determine program/tone to use, respects editor state same as playNote
+    if (current_state == STATE_PROGRAM_EDIT ||
+        current_state == STATE_TONE_EDIT    ||
+        current_state == STATE_ADSR_EDIT) {
+        program_to_use = edit_program;
+        tone_to_use = (current_state == STATE_TONE_EDIT ||
+                       current_state == STATE_ADSR_EDIT) ? edit_tone : 0;
+    } else {
+        program_to_use = current_program;
+        tone_to_use    = 0;
+    }
+
+    // If this exact note is already playing retrigger it
+    for (i = 0; i < MIDI_MAX_VOICES; i++) {
+        if (midi_voices[i].note == (short)note) {
+            SsUtKeyOff(midi_voices[i].voice_id,
+                       current_audio.vab_id,
+                       midi_voices[i].program,
+                       midi_voices[i].tone,
+                       midi_voices[i].note);
+            // Remove this slot by shifting later slots down
+            int j;
+            for (j = i; j < MIDI_MAX_VOICES - 1; j++) {
+                midi_voices[j] = midi_voices[j + 1];
+            }
+            midi_voices[MIDI_MAX_VOICES - 1].note     = -1;
+            midi_voices[MIDI_MAX_VOICES - 1].voice_id = -1;
+            if (midi_poly_count > 0) midi_poly_count--;
+            break;
+        }
+    }
+
+    // If all slots are full, steal the oldest (slot 0)
+    if (midi_poly_count >= MIDI_MAX_VOICES) {
+        SsUtKeyOff(midi_voices[0].voice_id,
+                   current_audio.vab_id,
+                   midi_voices[0].program,
+                   midi_voices[0].tone,
+                   midi_voices[0].note);
+        // Shift all slots down to discard slot 0
+        int j;
+        for (j = 0; j < MIDI_MAX_VOICES - 1; j++) {
+            midi_voices[j] = midi_voices[j + 1];
+        }
+        midi_voices[MIDI_MAX_VOICES - 1].note     = -1;
+        midi_voices[MIDI_MAX_VOICES - 1].voice_id = -1;
+        midi_poly_count--;
+    }
+
+    // Fire the new note with MIDI velocity as SPU volume
+    // SsUtKeyOn(vab_id, program, tone, note, fine, vol_left, vol_right)
+    new_voice = SsUtKeyOn(current_audio.vab_id,
+                          program_to_use, tone_to_use,
+                          (short)note, 0,
+                          (short)velocity, (short)velocity);
+
+    if (new_voice >= 0) {
+        // Store in the next free slot (guaranteed free after the steal above)
+        midi_voices[midi_poly_count].note     = (short)note;
+        midi_voices[midi_poly_count].voice_id = new_voice;
+        midi_voices[midi_poly_count].program  = program_to_use;
+        midi_voices[midi_poly_count].tone     = tone_to_use;
+        midi_poly_count++;
+
+        // Apply any pitch bend that arrived before this note was triggered.
+        // SsUtPitchBend(voice, vabId, prog, note, pbend)
+		// 64 = center (no bend)
+        if (midi_pitch_bend != 64) {
+            SsUtPitchBend(new_voice, current_audio.vab_id,
+                          program_to_use, (short)note, midi_pitch_bend);
+        }
+
+        // Keep current_note in sync so the UI displays the last triggered note
+        current_note = (short)note;
+        // note_playing reflects whether ANY voice is active (MIDI or controller)
+        note_playing = 1;
+    }
+}
+
+// Release a specific MIDI note by number
+// Searches the pool; does nothing if the note is not found
+void midiNoteOff(u_char note)
+{
+    int i;
+    for (i = 0; i < MIDI_MAX_VOICES; i++) {
+        if (midi_voices[i].note == (short)note) {
+            SsUtKeyOff(midi_voices[i].voice_id,
+                       current_audio.vab_id,
+                       midi_voices[i].program,
+                       midi_voices[i].tone,
+                       midi_voices[i].note);
+            // Remove slot by shifting later slots down
+            int j;
+            for (j = i; j < MIDI_MAX_VOICES - 1; j++) {
+                midi_voices[j] = midi_voices[j + 1];
+            }
+            midi_voices[MIDI_MAX_VOICES - 1].note     = -1;
+            midi_voices[MIDI_MAX_VOICES - 1].voice_id = -1;
+            if (midi_poly_count > 0) midi_poly_count--;
+            break;
+        }
+    }
+    // Update note_playing, remain true if the controller note or other MIDI voices are active
+    if (midi_poly_count == 0 && !note_playing) {
+        note_playing = 0;
+    } else if (midi_poly_count == 0 && current_voice < 0) {
+        note_playing = 0;
+    }
+}
+
+// Silence every active MIDI voice, called when Serial MIDI is stopped
+void midiAllNotesOff(void)
+{
+    int i;
+    for (i = 0; i < MIDI_MAX_VOICES; i++) {
+        if (midi_voices[i].note >= 0 && midi_voices[i].voice_id >= 0) {
+            SsUtKeyOff(midi_voices[i].voice_id,
+                       current_audio.vab_id,
+                       midi_voices[i].program,
+                       midi_voices[i].tone,
+                       midi_voices[i].note);
+        }
+        midi_voices[i].note     = -1;
+        midi_voices[i].voice_id = -1;
+    }
+    midi_poly_count = 0;
+    // Only clear note_playing if the controller note is also silent
+    if (current_voice < 0) {
+        note_playing = 0;
+    }
+}
+
+// Open the SIO port at MIDI baud, configure 8-N-1, enable RX interrupt
+// If serial MIDI is already running, calling this again toggles it off
+void startSerialMidi(void)
+{
+    if (serial_midi_enabled) {
+        stopSerialMidi();
+        return;
+    }
+
+    AddSIO(MIDI_BAUD);
+
+    // Communications mode: 8-N-1
+    //   MR_CHLEN_8 = bits 3,2 = 11 = 0x0C   (8-bit character)
+    //   MR_SB_01   = bits 7,6 = 01 = 0x40   (1 stop bit)
+    //   bit 1 always 1         = 0x02
+    //   Result: 0x4E
+    _sio_control(1, 2, 0x4E);
+
+    // Control register: enable receive interrupt, receive, and transmit
+    //   CR_RXIEN = bit 11 = 0x800
+    //   CR_RXEN  = bit  2 = 0x004
+    //   CR_TXEN  = bit  0 = 0x001
+    //   Result: 0x805
+    _sio_control(1, 1, 0x805);
+
+    Sio1Callback(sioRxIsr);
+
+    // Reset ring buffer and parser state
+    midi_rx_head    = 0;
+    midi_rx_tail    = 0;
+    midi_run_status = 0;
+    midi_pbuf_pos   = 0;
+    midi_pbuf_exp   = 0;
+
+    serial_midi_enabled = 1;
+    sprintf(midi_last_msg, "Connected %d baud", MIDI_BAUD);
+    midi_msg_timer = MIDI_DISPLAY_FRAMES;
+}
+
+// Tear down the SIO port and clear all Serial MIDI state
+void stopSerialMidi(void)
+{
+    if (!serial_midi_enabled) return;
+
+    Sio1Callback(0);        // remove ISR first so no more bytes arrive
+    _sio_control(1, 1, 0);  // disable all SIO control/interrupt bits
+    DelSIO();
+
+    // Silence every MIDI-triggered voice
+    midiAllNotesOff();
+
+    serial_midi_enabled = 0;
+    midi_pitch_bend     = 64;   // Reset to center
+    midi_msg_timer = 0;
+    midi_last_msg[0] = '\0';
+}
+
+// Apply a single NRPN ADSR attribute (nrpn_lsb 4-12) to one tone
+// Decode existing ADSR, modify the named field, re-encode and save via SsUtSetVagAtr
+// keeps the ADSR/Tone editor in sync
+static void applyNrpnAdsr(short prog, int tone_num, u_char attr, u_char value)
+{
+    VagAtr va;
+    AdsrParams params;
+    int temp_val;
+
+    if (SsUtGetVagAtr(current_audio.vab_id, prog, (short)tone_num, &va) != 0)
+        return;
+
+    decodeADSR(va.adsr1, va.adsr2, &params);
+
+    switch (attr) {
+        case 4:  // Attack rate   0-127
+            temp_val = (int)value;
+            if (temp_val > 127) temp_val = 127;
+            params.attack = temp_val;
+            break;
+        case 5:  // Attack exp    0=off, >0=on
+            params.attackExponential = (value > 0) ? 1 : 0;
+            break;
+        case 6:  // Decay rate    0-15
+            temp_val = (int)value;
+            if (temp_val > 15) temp_val = 15;
+            params.decay = temp_val;
+            break;
+        case 7:  // Sustain level 0-15
+            temp_val = (int)value;
+            if (temp_val > 15) temp_val = 15;
+            params.sustainLevel = temp_val;
+            break;
+        case 8:  // Sustain rate  0-127
+            temp_val = (int)value;
+            if (temp_val > 127) temp_val = 127;
+            params.sustain = temp_val;
+            break;
+        case 9:  // Sustain exp   0=off, >0=on 
+            params.sustainExponential = (value > 0) ? 1 : 0;
+            break;
+        case 10: // Release rate  0-31
+            temp_val = (int)value;
+            if (temp_val > 31) temp_val = 31;
+            params.release = temp_val;
+            break;
+        case 11: // Release exp   0=off, >0=on
+            params.releaseExponential = (value > 0) ? 1 : 0;
+            break;
+        case 12: // Sustain sign  0-64=+  65-127=-
+            params.sustainSigned = (value > 64) ? 1 : 0;
+            break;
+        default:
+            return;
+    }
+
+    encodeADSR(&params, &va.adsr1, &va.adsr2);
+    SsUtSetVagAtr(current_audio.vab_id, prog, (short)tone_num, &va);
+
+    // Keep the Tone and ADSR editor structs in sync if this tone is open
+    if ((current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) &&
+        edit_program == (int)prog && edit_tone == tone_num) {
+        current_vag_atr.adsr1 = va.adsr1;
+        current_vag_atr.adsr2 = va.adsr2;
+        if (current_state == STATE_ADSR_EDIT) {
+            decodeADSR(va.adsr1, va.adsr2, &current_adsr);
+        }
+    }
+}
+
+// Process all bytes currently sitting in the ring buffer
+// Call once per frame from processInput() before handling pad input
+void processMidi(void)
+{
+    if (!serial_midi_enabled) return;
+
+    // Drain the ring buffer
+    while (midi_rx_tail != midi_rx_head) {
+        u_char b = midi_rx_buf[midi_rx_tail];
+        midi_rx_tail = (midi_rx_tail + 1) & (MIDI_RX_BUF_SIZE - 1);
+
+        if (b & 0x80) {
+            // Status byte
+            // Ignore real-time messages (clock 0xF8, active sense 0xFE, etc)
+            if (b == 0xF8 || b == 0xFE || b == 0xFF) continue;
+            // Ignore other system messages (SysEx start, song position, etc)
+            if (b >= 0xF0) { midi_pbuf_pos = 0; continue; }
+
+            // Regular channel message, start a new message
+            midi_run_status  = b;
+            midi_pbuf[0]     = b;
+            midi_pbuf_pos    = 1;
+            midi_pbuf_exp    = midiMsgLength(b);
+        } else {
+            // Data byte
+            // If no current message in progress, apply running status
+            if (midi_pbuf_pos == 0 && midi_run_status != 0) {
+                midi_pbuf[0]  = midi_run_status;
+                midi_pbuf_pos = 1;
+                midi_pbuf_exp = midiMsgLength(midi_run_status);
+            }
+            if (midi_pbuf_pos > 0 && midi_pbuf_pos < 3) {
+                midi_pbuf[midi_pbuf_pos++] = b;
+            }
+        }
+
+        // Complete message?
+        if (midi_pbuf_pos > 0 && midi_pbuf_pos >= midi_pbuf_exp) {
+            u_char msg_type = midi_pbuf[0] & 0xF0;
+            u_char channel  = (midi_pbuf[0] & 0x0F) + 1;   // 1-based for display
+            u_char d1 = (midi_pbuf_exp > 1) ? midi_pbuf[1] : 0;
+            u_char d2 = (midi_pbuf_exp > 2) ? midi_pbuf[2] : 0;
+
+            switch (msg_type) {
+
+                case 0x90:  // Note On
+                    if (d2 > 0) {
+                        // Velocity > 0: genuine Note On
+                        midiNoteOn(d1, d2);
+                        sprintf(midi_last_msg, "NoteOn  N%3d V%3d CH%2d", d1, d2, channel);
+                    } else {
+                        // Velocity == 0 is treated as Note Off
+                        midiNoteOff(d1);
+                        sprintf(midi_last_msg, "NoteOff N%3d       CH%2d", d1, channel);
+                    }
+                    midi_msg_timer = MIDI_DISPLAY_FRAMES;
+                    break;
+
+                case 0x80:  // Note Off
+                    midiNoteOff(d1);
+                    sprintf(midi_last_msg, "NoteOff N%3d V%3d CH%2d", d1, d2, channel);
+                    midi_msg_timer = MIDI_DISPLAY_FRAMES;
+                    break;
+
+                case 0xC0: {  // Program Change
+                    short new_prog = (short)d1;
+                    if (new_prog < (short)current_audio.num_programs) {
+                        current_program = new_prog;
+                        // Sync editor program selector when in edit screens
+                        if (current_state == STATE_PROGRAM_EDIT ||
+                            current_state == STATE_TONE_EDIT    ||
+                            current_state == STATE_ADSR_EDIT) {
+                            edit_program = new_prog;
+                            loadProgramData();
+                        }
+                        sprintf(midi_last_msg, "ProgChg P%3d       CH%2d", d1, channel);
+                    } else {
+                        // Out-of-range program: reject and show warning
+                        sprintf(midi_last_msg, "ProgChg P%3d >max! CH%2d", d1, channel);
+                    }
+                    midi_msg_timer = MIDI_DISPLAY_FRAMES;
+                    break;
+                }
+
+                case 0xB0: {  // Control Change
+
+                    // --------------------------------------------------
+                    // NRPN accumulation (CC99+CC98+CC06)
+                    // Reverb NRPNs work even without a sequence loaded
+                    // --------------------------------------------------
+                    if (d1 == 99) {              // NRPN MSB
+                        midi_nrpn_msb = d2;
+                        midi_nrpn_lsb = 0xFF;    // invalidate LSB on new MSB
+                        break;
+                    }
+                    if (d1 == 98) {              // NRPN LSB
+                        midi_nrpn_lsb = d2;
+                        break;
+                    }
+                    if (d1 == 6 &&               // Data Entry
+                        midi_nrpn_msb != 0xFF && midi_nrpn_lsb != 0xFF) {
+
+                        u_char n_tone = midi_nrpn_msb;   // CC99 value
+                        u_char n_attr = midi_nrpn_lsb;   // CC98 value
+
+                        if (n_tone == 16 && n_attr >= 15 && n_attr <= 19) {
+                            // Reverb and echo settings
+                            switch (n_attr) {
+                                case 15: // Reverb type 0-9
+                                    reverb_type = (short)d2;
+                                    if (reverb_type > 9) reverb_type = 9;
+                                    SsUtSetReverbType(reverb_type);
+                                    SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
+                                    sprintf(midi_last_msg, "NRPN RevType:%s",
+                                            getReverbTypeName(reverb_type));
+                                    break;
+                                case 16: // Reverb depth 0-127
+                                    reverb_depth_left  = (short)d2;
+                                    reverb_depth_right = (short)d2;
+                                    SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
+                                    sprintf(midi_last_msg, "NRPN RevDepth:%3d", d2);
+                                    break;
+                                case 17: // Echo feedback 0-127
+                                    reverb_feedback = (short)d2;
+                                    SsUtSetReverbFeedback(reverb_feedback);
+                                    sprintf(midi_last_msg, "NRPN Feedback:%3d", d2);
+                                    break;
+                                case 18: // Echo delay time 0-127
+                                case 19: // Delay time 0-127
+                                    reverb_delay = (short)d2;
+                                    SsUtSetReverbDelay(reverb_delay);
+                                    sprintf(midi_last_msg, "NRPN Delay:   %3d", d2);
+                                    break;
+                            }
+                            midi_msg_timer = MIDI_DISPLAY_FRAMES;
+
+                        } else if (n_attr >= 4 && n_attr <= 12 &&
+                                   current_audio.vab_id >= 0) {
+
+                            // ADSR parameter for a specific tone (0-15) or all tones (16)
+                            short cc_prog = (current_state == STATE_PROGRAM_EDIT ||
+                                             current_state == STATE_TONE_EDIT    ||
+                                             current_state == STATE_ADSR_EDIT)
+                                            ? (short)edit_program
+                                            : (short)current_program;
+
+                            if (n_tone == 16) {
+                                ProgAtr pa;
+                                int t, ntones = 0;
+                                if (SsUtGetProgAtr(current_audio.vab_id, cc_prog, &pa) == 0)
+                                    ntones = pa.tones;
+                                for (t = 0; t < ntones; t++)
+                                    applyNrpnAdsr(cc_prog, t, n_attr, d2);
+                            } else if (n_tone <= 15) {
+                                applyNrpnAdsr(cc_prog, (int)n_tone, n_attr, d2);
+                            }
+                            sprintf(midi_last_msg, "NRPN T%2d A%2d V%3d",
+                                    n_tone, n_attr, d2);
+                            midi_msg_timer = MIDI_DISPLAY_FRAMES;
+                        }
+                        break;
+                    }
+
+                    // CC7 volume and CC10 pan, only when a VAB is loaded
+                    if (current_audio.vab_id < 0) break;
+
+                    // Target Editor program if in Editor
+                    short cc_prog = (current_state == STATE_PROGRAM_EDIT ||
+                                     current_state == STATE_TONE_EDIT    ||
+                                     current_state == STATE_ADSR_EDIT)
+                                    ? (short)edit_program
+                                    : (short)current_program;
+
+                    if (d1 == 7 || d1 == 10) {
+                        // Read the current attributes
+                        ProgAtr pa;
+                        if (SsUtGetProgAtr(current_audio.vab_id, cc_prog, &pa) == 0) {
+                            if (d1 == 7) {      // CC 7: Channel Volume
+                                pa.mvol = (u_char)d2;
+                                SsUtSetProgAtr(current_audio.vab_id, cc_prog, &pa);
+                                // Keep editor struct in sync so UI reflects the change
+                                if (current_state == STATE_PROGRAM_EDIT ||
+                                    current_state == STATE_TONE_EDIT    ||
+                                    current_state == STATE_ADSR_EDIT) {
+                                    current_prog_atr.mvol = pa.mvol;
+                                }
+                                sprintf(midi_last_msg, "CC Vol  P%3d V%3d CH%2d",
+                                        cc_prog, d2, channel);
+                            } else {            // CC 10: Pan
+                                pa.mpan = (u_char)d2;
+                                SsUtSetProgAtr(current_audio.vab_id, cc_prog, &pa);
+                                if (current_state == STATE_PROGRAM_EDIT ||
+                                    current_state == STATE_TONE_EDIT    ||
+                                    current_state == STATE_ADSR_EDIT) {
+                                    current_prog_atr.mpan = pa.mpan;
+                                }
+                                sprintf(midi_last_msg, "CC Pan  P%3d V%3d CH%2d",
+                                        cc_prog, d2, channel);
+                            }
+                            midi_msg_timer = MIDI_DISPLAY_FRAMES;
+                        }
+                    }
+                    // All other CC numbers are silently ignored
+                    break;
+                }
+
+                case 0xE0: {  // Pitch Bend
+                    // MIDI pitch bend is a 14-bit value: (d2 << 7) | d1
+                    // Center = 8192 (0x2000).  The MSB (d2) is a 7-bit value 0-127 with 64 as center
+                    // maps directly to SsUtPitchBend's pbend parameter
+                    midi_pitch_bend = (short)d2;  // 0-127, 64 = no bend
+
+                    // Apply to every active MIDI voice
+                    {
+                        int vi;
+                        for (vi = 0; vi < midi_poly_count; vi++) {
+                            if (midi_voices[vi].voice_id >= 0) {
+                                SsUtPitchBend(midi_voices[vi].voice_id,
+                                              current_audio.vab_id,
+                                              midi_voices[vi].program,
+                                              midi_voices[vi].note,
+                                              midi_pitch_bend);
+                            }
+                        }
+                    }
+                    sprintf(midi_last_msg, "PitchBnd %3d       CH%2d", midi_pitch_bend, channel);
+                    midi_msg_timer = MIDI_DISPLAY_FRAMES;
+                    break;
+                }
+
+                default:
+                    // All other message types silently discarded
+                    break;
+            }
+
+            // Reset position for next message (running status stays set)
+            midi_pbuf_pos = 0;
+        }
+    }
+
+    // Count down the on-screen message display timer
+    if (midi_msg_timer > 0) midi_msg_timer--;
+}
+
+// Input Processing
 void processInput(void)
 {
+    // Process incoming Serial MIDI bytes before handling pad input
+    // MIDI-triggered notes are applied every frame regardless of UI state
+    processMidi();
+
     pad = PadRead(0);
     
     // Global controls that work in all states
-    
     // Select button behavior in playback states
     if (pad & PADselect && !(oldpad & PADselect)) {
         if (current_state == STATE_PLAYBACK || current_state == STATE_VAB_PLAYBACK) {
@@ -1444,7 +2064,7 @@ void processInput(void)
     }
     
     // Check if Select is being held (layer modifier active)
-    // When Select is held, normal inputs are blocked - only Select+button combos work
+    // When Select is held, normal inputs are blocked, only Select+button combos work
     int select_layer_active = (pad & PADselect) && (oldpad & PADselect);
     
     // Triangle - Play/Stop in SEQ mode (wrapped), Play note in VAB mode (always works)
@@ -1467,10 +2087,30 @@ void processInput(void)
         }
     }
     
-    // Start button - Pause in SEQ mode (disabled if Select held)
-    if (!select_layer_active && !vab_mode && (current_state == STATE_PLAYBACK || current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT)) {
+    // Start button:
+    //   SEQ mode  → Pause/Unpause sequence (as before)
+    //   VAB mode  → Toggle Serial MIDI on/off
+    //   (disabled when Select is held)
+    if (!select_layer_active) {
         if (pad & PADstart && !(oldpad & PADstart)) {
-            pauseSequence();
+            if (!vab_mode &&
+                (current_state == STATE_PLAYBACK      ||
+                 current_state == STATE_PROGRAM_EDIT  ||
+                 current_state == STATE_TONE_EDIT)) {
+                // SEQ mode: pause / unpause
+                pauseSequence();
+            } else if (vab_mode &&
+                       (current_state == STATE_VAB_PLAYBACK  ||
+                        current_state == STATE_PROGRAM_EDIT  ||
+                        current_state == STATE_TONE_EDIT     ||
+                        current_state == STATE_ADSR_EDIT)) {
+                // VAB mode: toggle Serial MIDI (startSerialMidi handles toggle-off)
+                if (serial_midi_enabled) {
+                    stopSerialMidi();
+                } else {
+                    startSerialMidi();
+                }
+            }
         }
     }
     
@@ -1544,7 +2184,7 @@ void processInput(void)
                 current_audio.vh_size = vh_files[selected_vh].size;
                 sprintf(current_audio.vh_name, "%s", vh_files[selected_vh].name);
                 
-                // Read VAB header info (using library's VabHdr struct)
+                // Read VAB header info using VabHdr struct
                 VabHdr* vab_hdr = (VabHdr*)current_audio.vh_data;
                 current_audio.num_programs = vab_hdr->ps;  // Note: 'ps' not 'programs'
                 current_audio.num_tones = vab_hdr->ts;     // Note: 'ts' not 'tones'
@@ -1769,10 +2409,13 @@ void processInput(void)
                 note_playing = 0;
                 current_voice = -1;
                 menu_cursor = 0;
+                initMidiVoices();  // Clear polyphony pool for fresh session
                 
                 current_state = STATE_VAB_PLAYBACK;
             }
             if (pad & PADRright && !(oldpad & PADRright)) { // Circle button - Back to SEQ select
+                // Safety: stop Serial MIDI if somehow still active
+                stopSerialMidi();
                 // Close VAB if any (going back to SEQ select)
                 if (current_audio.vab_id >= 0) {
                     SsVabClose(current_audio.vab_id);
@@ -1789,22 +2432,23 @@ void processInput(void)
             // This prevents stuck notes
             if (pad & PADRup) {
                 if (!(oldpad & PADRup)) {
-                    // Just pressed - play note
+                    // Triangle pressed
                     playNote();
                 }
-                // Holding - note sustains automatically
+                // Holding button, note sustains automatically
             } else {
                 if (oldpad & PADRup) {
-                    // Just released - stop note
+                    // Triangle released
                     stopNote();
                 }
             }
             
             // If Select is held, skip all other normal inputs (layer modifier)
             if (!select_layer_active) {
-                // Circle - Back to VH select
+                // Circle - Back to VH select; also closes Serial MIDI connection
                 if (pad & PADRright && !(oldpad & PADRright)) {
                     stopNote();
+                    stopSerialMidi();  // Close serial connection on leaving VAB mode
                     if (current_audio.vab_id >= 0) {
                         SsVabClose(current_audio.vab_id);
                         current_audio.vab_id = -1;
@@ -1919,7 +2563,7 @@ void processInput(void)
                 hold_counter_right = 0;
                 hold_active_right = 0;
             }
-            // End of normal inputs - closing select_layer_active check
+            // End of normal inputs, closing select_layer_active check
             }
             
             break;
@@ -2027,7 +2671,7 @@ void processInput(void)
                 hold_counter_right = 0;
                 hold_active_right = 0;
             }
-            // End of normal inputs - closing select_layer_active check
+            // End of normal inputs, closing select_layer_active check
             }
             
             // Triangle - Play note in VAB mode ALWAYS works (even when Select held)
@@ -2072,7 +2716,7 @@ void processInput(void)
                     }
                 }
                 
-                // All other normal inputs (wrapped - disabled when Select held)
+                // All other normal inputs (wrapped, disabled when Select held)
                 if (!select_layer_active) {
                     // Circle - Back to program edit
                 if (pad & PADRright && !(oldpad & PADRright)) {
@@ -2187,7 +2831,7 @@ void processInput(void)
                         hold_active_right = 0;
                     }
                 }
-                // End of normal inputs - closing select_layer_active check
+                // End of normal inputs, closing select_layer_active check
                 }
                 
                 // Triangle - Play note in VAB mode ALWAYS works (even when Select held)
@@ -2333,14 +2977,16 @@ void processInput(void)
     oldpad = pad;
 }
 
+//Initial screen, program boots to SEQ file selection
 void drawSeqSelect(void)
 {
     int i;
     
 	FntPrint("\n");
-    FntPrint("=== SELECT SEQUENCE FILE ===\n\n");
-    FntPrint("Available SEQ files:\n\n");
+    FntPrint("=== SEQ PLAYER ===\n\n");
+    FntPrint("AVAILABLE SEQ FILES:\n\n");
     
+	FntPrint("-------------------\n");
     for (i = 0; i < MAX_SEQ_FILES; i++) {
         if (i == cursor) {
             FntPrint("> %s\n", seq_files[i].name);
@@ -2348,10 +2994,13 @@ void drawSeqSelect(void)
             FntPrint("  %s\n", seq_files[i].name);
         }
     }
-    
+    FntPrint("-------------------\n");
+
     FntPrint("\n");
-    FntPrint("X: Select (SEQ Mode)\n");
-    FntPrint("Square: SOUNDBANK Mode\n");
+	FntPrint("(?)CONTROLS\n");
+    FntPrint("X: OPEN FILE IN SEQ MODE\n");
+    FntPrint("SQUARE: SOUNDBANK MODE\n");
+	FntPrint("[SKIPS SEQ FILE SELECTION]");
 }
 
 void drawVhSelect(void)
@@ -2359,10 +3008,11 @@ void drawVhSelect(void)
     int i;
     
 	FntPrint("\n");
-    FntPrint("=== SELECT SOUNDBANK ===\n\n");
-    FntPrint("Selected SEQ: %s\n\n", seq_files[selected_seq].name);
-    FntPrint("Available VH files:\n\n");
-    
+    FntPrint("=== SEQ PLAYER ===\n\n");
+    FntPrint("SELECTED SEQ: %s\n\n", seq_files[selected_seq].name);
+	FntPrint("AVAILABLE VH FILES:\n\n");
+
+    FntPrint("-------------------\n");
     for (i = 0; i < MAX_VH_FILES; i++) {
         if (i == cursor) {
             FntPrint("> %s\n", vh_files[i].name);
@@ -2370,10 +3020,12 @@ void drawVhSelect(void)
             FntPrint("  %s\n", vh_files[i].name);
         }
     }
-    
+    FntPrint("-------------------\n");
+
     FntPrint("\n");
-    FntPrint("X: Select\n");
-    FntPrint("Circle: Back\n");
+	FntPrint("(?)CONTROLS\n");
+    FntPrint("X: SELECT VH FILE\n");
+    FntPrint("CIRCLE: BACK TO MODE SELECT\n");
 }
 
 void drawPlayback(void)
@@ -2381,10 +3033,10 @@ void drawPlayback(void)
     const char* status_text;
     
     FntPrint("\n");
-    FntPrint("=== PLAYBACK ===\n\n");
+    FntPrint("=== SEQ PLAYER ===\n\n");
     FntPrint("SEQ: %s\n", current_audio.seq_name);
-    FntPrint("VH: %s\n", current_audio.vh_name);
-    FntPrint("Progs: %d Tones: %d\n\n", current_audio.num_programs, current_audio.num_tones);
+    FntPrint("VH: %s @%08X sz:%04X\n", current_audio.vh_name, (unsigned int)current_audio.vh_data, (unsigned int)current_audio.vh_size);
+    FntPrint("PROGS: %d TONES: %d\n\n", current_audio.num_programs, current_audio.num_tones);
     
     // Determine status
     if (is_playing && is_paused) {
@@ -2394,10 +3046,10 @@ void drawPlayback(void)
     } else {
         status_text = "STOPPED";
     }
-    FntPrint("Status: %s\n\n", status_text);
+    FntPrint("STATUS: %s\n\n", status_text);
     
     // Menu items
-    FntPrint("=== MENU ===\n");
+    FntPrint("-------------------\n");
     
     // PLAY
     if (menu_cursor == MENU_PLAY) {
@@ -2425,13 +3077,13 @@ void drawPlayback(void)
         if (tempo_changed) {
             FntPrint("> TEMPO: %d\n", current_tempo);
         } else {
-            FntPrint("> TEMPO: unchanged (X)\n");
+            FntPrint("> TEMPO: UNCHANGED (X)\n");
         }
     } else {
         if (tempo_changed) {
             FntPrint("  TEMPO: %d\n", current_tempo);
         } else {
-            FntPrint("  TEMPO: unchanged\n");
+            FntPrint("  TEMPO: UNCHANGED\n");
         }
     }
     
@@ -2469,14 +3121,16 @@ void drawPlayback(void)
     } else {
         FntPrint("  PROGRAM EDIT\n");
     }
+	FntPrint("-------------------\n");
     
-    FntPrint("\n=== CONTROLS ===\n");
-    FntPrint("X: Select\n");
-    FntPrint("Triangle: Play/Stop\n");
-    FntPrint("Start: Toggle Pause\n");
+	FntPrint("\n");
+    FntPrint("(?)CONTROLS\n");
+    FntPrint("X: SELECT\n");
+    FntPrint("TRIANGLE: PLAY/STOP\n");
+    FntPrint("START: TOGGLE PAUSE\n");
     FntPrint("L/R:-1/+1 L1/R1:-10+10\n");
-    FntPrint("Square: Min/Max\n");
-    FntPrint("Circle: Back\n");
+    FntPrint("SQUARE: MIN/MAX\n");
+    FntPrint("CIRCLE: BACK\n");
 }
 
 void drawVabVhSelect(void)
@@ -2484,9 +3138,10 @@ void drawVabVhSelect(void)
     int i;
     
     FntPrint("\n");
-    FntPrint("=== SOUNDBANK MODE ===\n\n");
-    FntPrint("Available VH files:\n\n");
+    FntPrint("=== VAB PLAYER ===\n\n");
+    FntPrint("AVAILABLE VH FILES:\n\n");
     
+	FntPrint("-------------------\n");
     for (i = 0; i < MAX_VH_FILES; i++) {
         if (i == cursor) {
             FntPrint("> %s\n", vh_files[i].name);
@@ -2494,10 +3149,12 @@ void drawVabVhSelect(void)
             FntPrint("  %s\n", vh_files[i].name);
         }
     }
-    
+    FntPrint("-------------------\n");
+
     FntPrint("\n");
-    FntPrint("X: Select\n");
-    FntPrint("Circle: Back to Mode Select\n");
+	FntPrint("(?)CONTROLS\n");
+    FntPrint("X: OPEN FILE IN SOUNDBANK MODE\n");
+    FntPrint("CIRCLE: BACK TO MODE SELECT\n");
 }
 
 void drawVabPlayback(void)
@@ -2508,18 +3165,36 @@ void drawVabPlayback(void)
     
     FntPrint("\n");
     FntPrint("=== VAB PLAYER ===\n\n");
-    FntPrint("VH: %s\n", current_audio.vh_name);
-    FntPrint("Programs: %d\n", current_audio.num_programs);
-    FntPrint("Tones: %d\n\n", current_audio.num_tones);
+    FntPrint("VH: %s @%08X sz:%04X\n", current_audio.vh_name, (unsigned int)current_audio.vh_data, (unsigned int)current_audio.vh_size);
+    FntPrint("PROGRAMS: %d\n", current_audio.num_programs);
+    FntPrint("TONES: %d\n\n", current_audio.num_tones);
     
     if (note_playing) {
-        FntPrint("Status: PLAYING\n\n");
+        // Show controller note and/or MIDI poly count
+        if (serial_midi_enabled && midi_poly_count > 0) {
+            FntPrint("STATUS: MIDI %d voice%s\n",
+                     midi_poly_count, midi_poly_count == 1 ? "" : "s");
+        } else {
+            FntPrint("STATUS: PLAYING\n");
+        }
     } else {
-        FntPrint("Status: STOPPED\n\n");
+        FntPrint("STATUS: STOPPED\n");
+    }
+    
+    // Serial MIDI status line
+    if (serial_midi_enabled) {
+        if (midi_msg_timer > 0) {
+            // Show last received MIDI message while timer is active
+            FntPrint("MIDI ON: %s\n\n", midi_last_msg);
+        } else {
+            FntPrint("MIDI ON: LISTENING...\n\n");
+        }
+    } else {
+        FntPrint("MIDI OFF  (START TO ENABLE)\n\n");
     }
     
     // Menu items
-    FntPrint("=== MENU ===\n");
+    FntPrint("-------------------\n");
     
     // NOTE
     if (menu_cursor == VAB_MENU_NOTE) {
@@ -2569,13 +3244,16 @@ void drawVabPlayback(void)
     } else {
         FntPrint("  PROGRAM EDIT\n");
     }
-    
-    FntPrint("\n=== CONTROLS ===\n");
-    FntPrint("Triangle: Play Note\n");
-    FntPrint("L2/R2: Note +/-\n");
+    FntPrint("-------------------\n");
+
+	FntPrint("\n");
+    FntPrint("(?)CONTROLS\n");
+    FntPrint("TRIANGLE: PLAY NOTE\n");
+    FntPrint("START: MIDI ON/OFF\n");
+    FntPrint("L2/R2: NOTE +/-\n");
     FntPrint("L/R:-1/+1 L1/R1:-10+10\n");
-    FntPrint("Square: Min/Max\n");
-    FntPrint("Circle: Back\n");
+    FntPrint("SQUARE: MIN/MAX\n");
+    FntPrint("CIRCLE: BACK\n");
 }
 
 void drawProgramEdit(void)
@@ -2585,23 +3263,31 @@ void drawProgramEdit(void)
     FntPrint("\n");
     FntPrint("=== PROGRAM EDITOR ===  ");
 	
-	// Display an indicator when SEQ or note is playing on submenus
+	// Display playback/MIDI status indicators in the header
 	if (note_playing) {
         FntPrint("*NOTE ON*");
     }
-
 	if (is_playing && is_paused) {
         FntPrint("*PAUSED*");
     } else if (is_playing) {
         FntPrint("*PLAYING*");
     }
+    FntPrint("\n");
 
-    FntPrint("\n\nVH: %s\n", current_audio.vh_name);
-    FntPrint("Programs: %d\n", vab_hdr->ps);
-    FntPrint("Tones: %d\n", vab_hdr->ts);
+    // Show last MIDI message if one arrived recently
+    if (serial_midi_enabled && vab_mode && midi_msg_timer > 0) {
+        FntPrint("RX: %s\n", midi_last_msg);
+    } else {
+        FntPrint("\n");
+    }
+
+    FntPrint("VH: %s\n", current_audio.vh_name);
+    FntPrint("PROGRAMS: %d\n", vab_hdr->ps);
+    FntPrint("TONES: %d\n", vab_hdr->ts);
     FntPrint("VAGs: %d\n\n", vab_hdr->vs);
     
-    FntPrint("=== MENU ===\n");
+	// Menu items
+    FntPrint("-------------------\n");
     
     // PROGRAM SELECTOR
     if (menu_cursor == PROG_MENU_PROGRAM_SEL) {
@@ -2612,7 +3298,7 @@ void drawProgramEdit(void)
     
     // NUM TONES (press X to edit)
     if (menu_cursor == PROG_MENU_NUM_TONES) {
-        FntPrint("> TONES: %d (X:Edit)\n", current_prog_atr.tones);
+        FntPrint("> TONES: %d (X:EDIT)\n", current_prog_atr.tones);
     } else {
         FntPrint("  TONES: %d\n", current_prog_atr.tones);
     }
@@ -2652,16 +3338,19 @@ void drawProgramEdit(void)
         FntPrint("  MASTER PAN: %d%s\n", vab_master_pan,
                  isProgramValueChanged(PROG_MENU_MASTER_PAN) ? " !" : "");
     }
-    
-    FntPrint("\n=== CONTROLS ===\n");
+    FntPrint("-------------------\n");
+
+    FntPrint("\n");
+    FntPrint("(?)CONTROLS\n");
     if (vab_mode) {
-        FntPrint("Triangle: Play\n");
-        FntPrint("L2/R2: Note +/-\n");
+        FntPrint("TRIANGLE: PLAY\n");
+        FntPrint("L2/R2: NOTE +/-\n");
+        FntPrint("START: MIDI ON/OFF\n");
     } else {
-        FntPrint("Triangle: Play/Stop\n");
-        FntPrint("Start: Pause\n");
+        FntPrint("TRIANGLE: PLAY/STOP\n");
+        FntPrint("START: PAUSE\n");
     }
-    FntPrint("Circle: Back\n");
+    FntPrint("CIRCLE: BACK\n");
 }
 
 void drawToneEdit(void)
@@ -2674,22 +3363,27 @@ void drawToneEdit(void)
     FntPrint("\n");
     FntPrint("=== TONE EDITOR ===  ");
 
-	// Display an indicator when SEQ or note is playing on submenus
+	// Display status indicators in the header
 	if (note_playing) {
         FntPrint("*NOTE ON*");
     }
-
 	if (is_playing && is_paused) {
         FntPrint("*PAUSED*");
     } else if (is_playing) {
         FntPrint("*PLAYING*");
     }
+    FntPrint("\n");
 
-    FntPrint("\n\nProg: %d  VAG: %d\n\n", current_vag_atr.prog, current_vag_atr.vag);
+    // Show last MIDI message
+    if (serial_midi_enabled && vab_mode && midi_msg_timer > 0) {
+        FntPrint("RX: %s\n", midi_last_msg);
+    } else {
+        FntPrint("\n");
+    }
     
-    FntPrint("=== MENU ===\n");
+    FntPrint("-------------------\n");
     
-    // PROGRAM (navigable)
+    // Menu items
     if (menu_cursor == TONE_MENU_PROG) {
         FntPrint("> PROGRAM: %d\n", edit_program);
     } else {
@@ -2698,7 +3392,8 @@ void drawToneEdit(void)
     
     // TONE SELECTOR
     if (menu_cursor == TONE_MENU_TONE_SEL) {
-        FntPrint("> TONE: %d/%d\n", edit_tone, current_prog_atr.tones - 1);
+        FntPrint("> TONE: %d/%d", edit_tone, current_prog_atr.tones - 1);
+		FntPrint(" VAG: %d\n", current_vag_atr.vag);
     } else {
         FntPrint("  TONE: %d/%d\n", edit_tone, current_prog_atr.tones - 1);
     }
@@ -2806,7 +3501,7 @@ void drawToneEdit(void)
     
     // ADSR1 - Press X to enter parameter editor
     if (menu_cursor == TONE_MENU_ADSR1) {
-        FntPrint("> ADSR1: 0x%04X (X:Edit)%s\n", current_vag_atr.adsr1,
+        FntPrint("> ADSR1: 0x%04X (X:EDIT)%s\n", current_vag_atr.adsr1,
                  isToneValueChanged(TONE_MENU_ADSR1) ? " !" : "");
     } else {
         FntPrint("  ADSR1: 0x%04X%s\n", current_vag_atr.adsr1,
@@ -2815,34 +3510,52 @@ void drawToneEdit(void)
     
     // ADSR2 - Press X to enter parameter editor
     if (menu_cursor == TONE_MENU_ADSR2) {
-        FntPrint("> ADSR2: 0x%04X (X:Edit)%s\n", current_vag_atr.adsr2,
+        FntPrint("> ADSR2: 0x%04X (X:EDIT)%s\n", current_vag_atr.adsr2,
                  isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
     } else {
         FntPrint("  ADSR2: 0x%04X%s\n", current_vag_atr.adsr2,
                  isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
     }
-    
-    FntPrint("\n=== CONTROLS ===\n");
-    if (adsr_editing > 0) {
-        FntPrint("X: Confirm\n");
-        FntPrint("Circle: Cancel\n");
-    } else {
-        if (vab_mode) {
-            FntPrint("Triangle: Play\n");
-            FntPrint("L2/R2: Note +/-\n");
-			FntPrint("SEL+L1/R1: Program +/-\n");
-        } else {
-            FntPrint("Triangle: Play/Stop\n");
-            FntPrint("Start: Pause\n");
-        }
-        FntPrint("Circle: Back\n");
-    }
+    FntPrint("-------------------\n");
+
+    FntPrint("\n");
+    FntPrint("(?)CONTROLS\n");
+	if (vab_mode) {
+		FntPrint("L/R:-1/+1 L1/R1:-10+10 SQUARE: MIN/MAX");
+		FntPrint("TRIANGLE: PLAY L2/R2: NOTE+/-\n");
+		FntPrint("START: MIDI ON/OFF\n");
+		FntPrint("SEL+L1/R1: PROGRAM CHANGE\n");
+	} else {
+		FntPrint("L/R:-1/+1 L1/R1:-10+10\n");
+    	FntPrint("SQUARE: MIN/MAX\n");
+		FntPrint("TRIANGLE: PLAY/STOP\n");
+		FntPrint("START: PAUSE\n");
+	}
+	FntPrint("CIRCLE: BACK\n");
 }
 
 void drawAdsrEdit(void)
 {
     FntPrint("\n");
-    FntPrint("=== ADSR EDIT ===\n\n");
+    FntPrint("=== ADSR EDITOR ===");
+
+	// Display playback status indicator
+	if (note_playing) {
+        FntPrint("*NOTE ON*");
+    }
+	if (is_playing && is_paused) {
+        FntPrint("*PAUSED*");
+    } else if (is_playing) {
+        FntPrint("*PLAYING*");
+    }
+    FntPrint("\n");
+
+    // Show MIDI indicator when active in VAB mode
+    if (serial_midi_enabled && vab_mode && midi_msg_timer > 0) {
+        FntPrint("RX: %s\n", midi_last_msg);
+    } else {
+        FntPrint("\n");
+    }
     
     // Display current hex values
     u_short temp_adsr1, temp_adsr2;
@@ -2850,7 +3563,10 @@ void drawAdsrEdit(void)
     FntPrint("ADSR1: 0x%04X\n", temp_adsr1);
     FntPrint("ADSR2: 0x%04X\n\n", temp_adsr2);
     
-    FntPrint("=== PARAMETERS ===\n");
+    FntPrint("PARAMETERS:\n");
+
+	FntPrint("\n");
+	FntPrint("-------------------\n");
     
     // Attack Rate
     if (menu_cursor == ADSR_MENU_ATTACK_RATE) {
@@ -2948,15 +3664,19 @@ void drawAdsrEdit(void)
     } else {
         FntPrint("  CANCEL\n");
     }
+	FntPrint("-------------------\n");
     
-    FntPrint("\n=== CONTROLS ===\n");
+    FntPrint("\n");
+    FntPrint("(?)CONTROLS\n");
     if (vab_mode) {
-        FntPrint("Triangle: Play\n");
-        FntPrint("L2/R2: Note +/-\n");
+        FntPrint("TRIANGLE: PLAY\n");
+        FntPrint("L2/R2: NOTE +/-\n");
+        FntPrint("START: MIDI ON/OFF\n");
     }
-    FntPrint("Circle: Cancel\n");
+    FntPrint("CIRCLE: CANCEL\n");
 }
 
+#if HAS_BACKGROUND_IMAGE
 // In drawBackground() - Fix UV coordinates for 320x240:
 void drawBackground(void)
 {
@@ -3062,6 +3782,7 @@ void drawBackground(void)
         DrawPrim(&bg_poly_right);
     }
 }
+#endif // HAS_BACKGROUND_IMAGE
 
 void drawUI(void)
 {
@@ -3116,18 +3837,18 @@ int main(void)
         processInput();
         
 		#if HAS_BACKGROUND_IMAGE
-				drawBackground();  // Draw background image first if enabled
+			drawBackground();  // Draw background image first if enabled
 		#endif
 				
-				drawUI();
+		drawUI();
 				
 		#if HAS_BACKGROUND_IMAGE
-				// Only flush font buffer when not in full image mode
-				if (bg_state != 2) {
-					FntFlush(-1);
-				}
-		#else
+			// Only flush font buffer when not in full image mode
+			if (bg_state != 2) {
 				FntFlush(-1);
+			}
+		#else
+			FntFlush(-1);
 		#endif
         
         display();
