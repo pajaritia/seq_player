@@ -25,7 +25,7 @@ endif
 SEQ_FILES := $(wildcard ./SEQ/*.seq)
 VH_FILES := $(wildcard ./SOUNDBANK/VH/*.vh)
 
-# Limit to maximum 5 files each
+# Limit to maximum 15 files each
 SEQ_FILES := $(wordlist 1,15,$(SEQ_FILES))
 VH_FILES := $(wordlist 1,15,$(VH_FILES))
 
@@ -48,7 +48,7 @@ IMG_FILE := $(wildcard ./IMG/*.tim)
 ifneq ($(IMG_FILE),)
 IMG_FILE := $(word 1,$(IMG_FILE))
 $(info Found background image: $(IMG_FILE))
-$(info Supported: 16-bit TIM up to 320x240 (dual-primitive for 320-wide))
+$(info Supported: 16-bit TIM up to 320x240)
 HAS_IMAGE := 1
 else
 $(info No background image found in ./IMG/ directory (optional))
@@ -170,5 +170,9 @@ endif
 
 # Make fileconfig.h a prerequisite of all
 all: fileconfig.h
+
+# Debug menu toggle, comment this line out to strip all debug-menu code
+# Defining it here instead of the source ensures the IDE linter sees it
+CPPFLAGS += -DENABLE_DEBUG_MENU
 
 include ../common.mk
