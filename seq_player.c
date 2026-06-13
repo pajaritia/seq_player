@@ -7,7 +7,6 @@
 
 #include <sys/types.h>
 #include <stdio.h>
-#include <libgte.h>
 #include <libetc.h>
 #include <libgpu.h>
 #include <libsnd.h>
@@ -20,6 +19,9 @@
 #define VMODE 0                 // Video Mode : 0 : NTSC, 1: PAL
 #define SCREENXRES 320
 #define SCREENYRES 240
+
+// Debug menu is configured in the Makefile via CPPFLAGS += -DENABLE_DEBUG_MENU
+// Comment that line to remove debug from build
 
 DISPENV disp[2];
 DRAWENV draw[2];
@@ -34,7 +36,11 @@ typedef enum {
     STATE_VAB_PLAYBACK,
     STATE_PROGRAM_EDIT,
     STATE_TONE_EDIT,
-    STATE_ADSR_EDIT
+    STATE_ADSR_EDIT,
+    STATE_VISUALIZER,
+#ifdef ENABLE_DEBUG_MENU
+    STATE_DEBUG
+#endif
 } UIState;
 
 // SEQ mode menu items
@@ -48,6 +54,7 @@ typedef enum {
     MENU_REV_DELAY,
     MENU_REV_FEEDBACK,
     MENU_PROGRAM_EDIT,
+    MENU_VISUALIZER,
     MENU_ITEM_COUNT
 } PlaybackMenuItem;
 
@@ -60,6 +67,7 @@ typedef enum {
     VAB_MENU_REV_DELAY,
     VAB_MENU_REV_FEEDBACK,
     VAB_MENU_PROGRAM_EDIT,
+    VAB_MENU_VISUALIZER,
     VAB_MENU_ITEM_COUNT
 } VabPlaybackMenuItem;
 
@@ -213,6 +221,19 @@ typedef struct {
 MidiVoice midi_voices[MIDI_MAX_VOICES];
 int midi_poly_count = 0;  // Number of currently active MIDI voices
 
+#ifdef ENABLE_DEBUG_MENU
+// Display last voice triggered by playNote() or midiNoteOn()
+static int debug_voice = -1;
+// Save previous state
+static UIState pre_debug_state = STATE_SEQ_SELECT;
+#endif
+
+// Visualizer per-voice volume cache
+// vis_voice_map_vol : SpuGetVoiceVolume peak mapped 0-100, latched once at key-on
+// vis_voice_was_on  : previous-frame key status
+static int  vis_voice_map_vol[24];
+static char vis_voice_was_on[24];
+
 // Program/Tone editing variables
 int edit_program = 0;  // Currently selected program for editing
 int edit_tone = 0;  // Currently selected tone for editing
@@ -243,11 +264,11 @@ int hold_counter_down = 0;
 int hold_active_up = 0;
 int hold_active_down = 0;
 
-// Standard MIDI baud rate
+// Using 115200 for Baud Rate but can be changed, MIDI uses a different standard
 #define MIDI_BAUD            115200
-// Ring buffer size — MUST be a power of 2 for the & mask trick
+// Ring buffer size for MIDI = 2^6
 #define MIDI_RX_BUF_SIZE     64
-// How many frames to keep the last MIDI message on screen (~3s at 60 Hz)
+// Midi message duration in frames
 #define MIDI_DISPLAY_FRAMES  180
 
 // Ring buffer written by the SIO ISR, drained by the main loop
@@ -325,7 +346,12 @@ void exitAdsrEdit(int save);
 void adjustAdsrValue(int direction, int amount);
 void toggleAdsrValue(void);
 void drawAdsrEdit(void);
+void drawVisualizer(void);
 int isAdsrValueChanged(int menu_item);
+
+#ifdef ENABLE_DEBUG_MENU
+void drawDebug(void);
+#endif
 
 // Serial MIDI functions
 static int  midiMsgLength(u_char status);
@@ -693,9 +719,12 @@ void playNote(void)
     // Play the note using the appropriate program, tone, and note value
     // SsUtKeyOn(vab_id, program, tone, note, fine, vol_left, vol_right)
     current_voice = SsUtKeyOn(current_audio.vab_id, program_to_use, tone_to_use, current_note, 0, 127, 127);
-    
+
     if (current_voice >= 0) {
         note_playing = 1;
+#ifdef ENABLE_DEBUG_MENU
+        debug_voice = current_voice;
+#endif
     }
 }
 
@@ -1524,6 +1553,12 @@ void initMidiVoices(void)
         midi_voices[i].tone     = 0;
     }
     midi_poly_count = 0;
+
+    // Reset visualizer volume cache
+    for (i = 0; i < 24; i++) {
+        vis_voice_map_vol[i] = 0;
+        vis_voice_was_on[i]  = SPU_OFF;
+    }
 }
 
 // Trigger a note from a MIDI NoteOn message
@@ -1601,7 +1636,7 @@ void midiNoteOn(u_char note, u_char velocity)
         midi_voices[midi_poly_count].tone     = tone_to_use;
         midi_poly_count++;
 
-        // Apply any pitch bend that arrived before this note was triggered.
+        // Apply any pitch bend that arrived before this note was triggered
         // SsUtPitchBend(voice, vabId, prog, note, pbend)
 		// 64 = center (no bend)
         if (midi_pitch_bend != 64) {
@@ -1613,6 +1648,9 @@ void midiNoteOn(u_char note, u_char velocity)
         current_note = (short)note;
         // note_playing reflects whether ANY voice is active (MIDI or controller)
         note_playing = 1;
+#ifdef ENABLE_DEBUG_MENU
+        debug_voice = new_voice;
+#endif
     }
 }
 
@@ -2048,7 +2086,54 @@ void processInput(void)
     processMidi();
 
     pad = PadRead(0);
-    
+
+#ifdef ENABLE_DEBUG_MENU
+    // Select+Start toggles the debug menu. Ssaves and restores the previous state
+#define DEBUG_TOGGLE_COMBO (PADselect | PADstart)
+    if ((pad    & DEBUG_TOGGLE_COMBO) == DEBUG_TOGGLE_COMBO &&
+        (oldpad & DEBUG_TOGGLE_COMBO) != DEBUG_TOGGLE_COMBO) {
+        if (current_state == STATE_DEBUG) {
+            current_state = pre_debug_state;
+        } else {
+            pre_debug_state = current_state;
+            current_state   = STATE_DEBUG;
+        }
+        oldpad = pad;
+        return;
+    }
+    if (current_state == STATE_DEBUG) {
+        // Circle to return to previous state
+        if ((pad & PADRright) && !(oldpad & PADRright)) {
+            current_state = pre_debug_state;
+            oldpad = pad;
+            return;
+        }
+     	// Triangle: interact with audio without leaving the debug screen
+        if (vab_mode) {
+            if (pad & PADRup) {
+                if (!(oldpad & PADRup)) {
+                    playNote();
+                }
+            } else {
+                if (oldpad & PADRup) {
+                    stopNote();
+                }
+            }
+        } else {
+            if ((pad & PADRup) && !(oldpad & PADRup)) {
+                if (is_playing) {
+                    stopSequence();
+                } else {
+                    playSequence();
+                }
+            }
+        }
+        oldpad = pad;
+        return;
+    }
+#undef DEBUG_TOGGLE_COMBO
+#endif
+
     // Global controls that work in all states
     // Select button behavior in playback states
     if (pad & PADselect && !(oldpad & PADselect)) {
@@ -2276,6 +2361,10 @@ void processInput(void)
                     case MENU_PROGRAM_EDIT:
                         enterProgramEdit();
                         break;
+                    case MENU_VISUALIZER:
+                        return_state = STATE_PLAYBACK;
+                        current_state = STATE_VISUALIZER;
+                        break;
                 }
             }
             
@@ -2499,6 +2588,9 @@ void processInput(void)
             if (pad & PADRdown && !(oldpad & PADRdown)) {
                 if (menu_cursor == VAB_MENU_PROGRAM_EDIT) {
                     enterProgramEdit();
+                } else if (menu_cursor == VAB_MENU_VISUALIZER) {
+                    return_state = STATE_VAB_PLAYBACK;
+                    current_state = STATE_VISUALIZER;
                 }
             }
             
@@ -2972,6 +3064,25 @@ void processInput(void)
             }
             
             break;
+            
+        case STATE_VISUALIZER:
+            // Circle: return to previous state
+            if (pad & PADRright && !(oldpad & PADRright)) {
+                current_state = return_state;
+            }
+            // Triangle in VAB mode still works for note preview
+            if (vab_mode) {
+                if (pad & PADRup) {
+                    if (!(oldpad & PADRup)) {
+                        playNote();
+                    }
+                } else {
+                    if (oldpad & PADRup) {
+                        stopNote();
+                    }
+                }
+            }
+            break;
     }
     
     oldpad = pad;
@@ -3121,6 +3232,13 @@ void drawPlayback(void)
     } else {
         FntPrint("  PROGRAM EDIT\n");
     }
+    
+    // VISUALIZER
+    if (menu_cursor == MENU_VISUALIZER) {
+        FntPrint("> VISUALIZER\n");
+    } else {
+        FntPrint("  VISUALIZER\n");
+    }
 	FntPrint("-------------------\n");
     
 	FntPrint("\n");
@@ -3243,6 +3361,13 @@ void drawVabPlayback(void)
         FntPrint("> PROGRAM EDIT\n");
     } else {
         FntPrint("  PROGRAM EDIT\n");
+    }
+    
+    // VISUALIZER
+    if (menu_cursor == VAB_MENU_VISUALIZER) {
+        FntPrint("> VISUALIZER\n");
+    } else {
+        FntPrint("  VISUALIZER\n");
     }
     FntPrint("-------------------\n");
 
@@ -3784,6 +3909,294 @@ void drawBackground(void)
 }
 #endif // HAS_BACKGROUND_IMAGE
 
+// ====================
+// SPU Visualizer
+// ====================
+
+// Format a MIDI note number into a fixed 3-char string (e.g. "C#4", "C 4", "---")
+// buf must be at least 4 bytes
+static void formatVoiceNote(int midi_note, char* buf)
+{
+    static const char* note_names[12] = {
+        "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
+    };
+    const char* nn = note_names[midi_note % 12];
+    int oct = (midi_note / 12) - 1;
+    char oct_c;
+    if      (oct < 0) oct_c = '-';
+    else if (oct > 9) oct_c = '+';
+    else              oct_c = (char)('0' + oct);
+
+    if (nn[1] != '\0') {       // sharp: 2-char name
+        buf[0] = nn[0]; buf[1] = nn[1]; buf[2] = oct_c;
+    } else {                   // natural: 1-char name, pad with space
+        buf[0] = nn[0]; buf[1] = ' ';   buf[2] = oct_c;
+    }
+    buf[3] = '\0';
+}
+
+// In seq mode we don't know the center of the tone that's playing a given note using a program from the VAB
+// Quick solution is to display only the difference from center
+static void formatNoteOffset(int offset, char* buf)
+{
+    int abs_off = offset < 0 ? -offset : offset;
+    char sign   = offset < 0 ? '-' : '+';
+    if (abs_off > 99) {
+        buf[0] = sign; buf[1] = sign; buf[2] = sign;
+    } else if (abs_off >= 10) {
+        buf[0] = sign;
+        buf[1] = (char)('0' + abs_off / 10);
+        buf[2] = (char)('0' + abs_off % 10);
+    } else {
+        buf[0] = ' ';
+        buf[1] = sign;
+        buf[2] = (char)('0' + abs_off);
+    }
+    buf[3] = '\0';
+}
+
+//   Bar fill = Display Vol / 10  (0-100 mapped to 0-10 segments)
+static void buildBar(int voice, char key_status_now, char* bar10)
+{
+    int i, fill;
+
+    // latch SpuGetVoiceVolume when voice first becomes active
+    if (key_status_now != SPU_OFF && vis_voice_was_on[voice] == SPU_OFF) {
+        short volL, volR;
+        short absL, absR, peak;
+        int   mapped;
+        SpuGetVoiceVolume(voice, &volL, &volR);
+        absL   = (volL < 0) ? (short)(-volL) : volL;
+        absR   = (volR < 0) ? (short)(-volR) : volR;
+        peak   = (absL > absR) ? absL : absR;
+        // Map 0-16383 -> 0-100 (Voice Map Vol)
+        mapped = ((int)peak * 100) / 16383;
+        if (mapped > 100) mapped = 100;
+        if (mapped < 0)   mapped = 0;
+        vis_voice_map_vol[voice] = mapped;
+    }
+    vis_voice_was_on[voice] = key_status_now;
+
+    if (key_status_now == SPU_OFF) {
+        fill = 0;
+    } else {
+        short envx = 0;
+        int   envx_mapped, display_vol;
+        // Read live ENVX value
+        SpuGetVoiceEnvelope(voice, &envx);
+        if (envx < 0) envx = 0;
+        // Map ENVX 0-32767 -> 0-100 (Voice Map ENVX Vol)
+        envx_mapped = ((int)envx * 100) / 32767;
+        if (envx_mapped > 100) envx_mapped = 100;
+        // Voice Display Vol = Voice Map ENVX * Voice Map Vol / 100
+        display_vol = (envx_mapped * vis_voice_map_vol[voice]) / 100;
+        // Map 0-100 -> 0-10 bar segments
+        fill = display_vol / 10;
+        if (fill > 10) fill = 10;
+    }
+
+    for (i = 0; i < 10; i++)
+        bar10[i] = (i < fill) ? '#' : '.';
+    bar10[10] = '\0';
+}
+
+void drawVisualizer(void)
+{
+    char key_status[24];
+    int i;
+    char note_l[4], note_r[4];
+    char bar_l[11], bar_r[11];
+    char key_l, key_r;
+    const char *rev_l, *rev_r;
+    u_short seq_note_raw;
+
+    // Build a voice-index/MIDI-note lookup SsUtKeyOn
+    short voice_note_map[24];
+    for (i = 0; i < 24; i++) voice_note_map[i] = -1;
+
+    // Controller note (Triangle button)
+    if (note_playing && current_voice >= 0 && current_voice < 24) {
+        voice_note_map[current_voice] = current_note;
+    }
+    // MIDI polyphony pool
+    for (i = 0; i < midi_poly_count; i++) {
+        if (midi_voices[i].voice_id >= 0 && midi_voices[i].voice_id < 24) {
+            voice_note_map[midi_voices[i].voice_id] = midi_voices[i].note;
+        }
+    }
+
+    SpuGetAllKeysStatus(key_status);
+
+    FntPrint("\n=== SPU VOICES ===\n\n");
+
+    for (i = 0; i < 24; i += 2) {
+        // ---- LEFT VOICE (i) ----
+        switch (key_status[i]) {
+            case SPU_ON:
+            case SPU_ON_ENV_OFF: key_l = 'S'; break;
+            case SPU_OFF_ENV_ON: key_l = 'R'; break;
+            default:             key_l = '-'; break;
+        }
+
+        if (key_status[i] != SPU_OFF) {
+            if (voice_note_map[i] >= 0) {
+                formatVoiceNote((int)voice_note_map[i], note_l);
+            } else if (!vab_mode) {
+                SpuGetVoiceNote(i, &seq_note_raw);
+                formatNoteOffset((int)((seq_note_raw >> 8) & 0xFF) - 0xC0, note_l);
+            } else {
+                note_l[0] = '-'; note_l[1] = '-'; note_l[2] = '-'; note_l[3] = '\0';
+            }
+        } else {
+            note_l[0] = '-'; note_l[1] = '-'; note_l[2] = '-'; note_l[3] = '\0';
+        }
+
+        rev_l = (reverb_type > 0 && key_status[i] != SPU_OFF) ? "REV" : "---";
+        buildBar(i, key_status[i], bar_l);
+
+        // ---- RIGHT VOICE (i+1) ----
+        switch (key_status[i + 1]) {
+            case SPU_ON:
+            case SPU_ON_ENV_OFF: key_r = 'S'; break;
+            case SPU_OFF_ENV_ON: key_r = 'R'; break;
+            default:             key_r = '-'; break;
+        }
+
+        if (key_status[i + 1] != SPU_OFF) {
+            if (voice_note_map[i + 1] >= 0) {
+                formatVoiceNote((int)voice_note_map[i + 1], note_r);
+            } else if (!vab_mode) {
+                SpuGetVoiceNote(i + 1, &seq_note_raw);
+                formatNoteOffset((int)((seq_note_raw >> 8) & 0xFF) - 0xC0, note_r);
+            } else {
+                note_r[0] = '-'; note_r[1] = '-'; note_r[2] = '-'; note_r[3] = '\0';
+            }
+        } else {
+            note_r[0] = '-'; note_r[1] = '-'; note_r[2] = '-'; note_r[3] = '\0';
+        }
+
+        rev_r = (reverb_type > 0 && key_status[i + 1] != SPU_OFF) ? "REV" : "---";
+        buildBar(i + 1, key_status[i + 1], bar_r);
+
+        // ---- Print voice info line ----
+        // Format: "V00 C#4 KEY:S REV / V01 --- KEY:- ---"
+        FntPrint("V%02d %s KEY:%c %s / V%02d %s KEY:%c %s\n",
+                 i,     note_l, key_l, rev_l,
+                 i + 1, note_r, key_r, rev_r);
+
+        // ---- Print volume bar line ----
+        // Format: "V00[##########]VOL/V01[..........]VOL"
+        FntPrint("   [%s]   /   [%s]   \n",
+                 bar_l, bar_r);
+    }
+
+    // MIDI status line
+    if (serial_midi_enabled) {
+        FntPrint("\n");
+        if (midi_msg_timer > 0) {
+            FntPrint("MIDI ON(%d): %s\n", midi_poly_count, midi_last_msg);
+        } else {
+            FntPrint("MIDI ON  %d voice%s  LISTENING...\n",
+                     midi_poly_count, midi_poly_count == 1 ? "" : "s");
+        }
+    }
+
+    FntPrint("            CIRCLE: BACK\n");
+}
+
+// ====================
+// Debug Menu
+// ====================
+// ENABLE_DEBUG_MENU must be #defined (top of file) to compile
+// Toggle with Select+Start
+// To display different data: edit drawDebug() below
+// debug_voice is the SPU voice index of the last triggered note
+#ifdef ENABLE_DEBUG_MENU
+
+// Direct read of the hardware ENVX register (live ADSR amplitude, 0x0000-0x7FFF)
+// Each voice occupies 0x10 bytes starting at SPU_VOICE_BASE
+#define SPU_VOICE_BASE    0x1F801C00UL
+#define SPU_VOICE_STRIDE  0x10
+#define SPU_VOICE_ENV_OFF 0x0C
+static unsigned short spuReadEnvelope(int voice)
+{
+    volatile unsigned short *reg =
+        (volatile unsigned short *)(SPU_VOICE_BASE + (unsigned long)voice * SPU_VOICE_STRIDE + SPU_VOICE_ENV_OFF);
+    return *reg;
+}
+
+void drawDebug(void)
+{
+    SpuVoiceAttr   attr;
+    unsigned short live_env;
+    int            midi_n, cent;
+    char           nstr[4];
+
+    FntPrint("\n");
+
+    if (debug_voice < 0) {
+        FntPrint("=== DEBUG: NO VOICE ===\n\n");
+        FntPrint("No voice triggered yet.\n");
+        if (vab_mode) {
+            FntPrint("TRI:PLAY  CIR:BACK  SEL+STA+L1+R1:BACK\n");
+        } else {
+            FntPrint("TRI:PLAY/STP  CIR:BACK  SEL+STA+L1+R1:BACK\n");
+        }
+        return;
+    }
+
+    // Fetch all live attributes for the tracked voice
+    // mask = 0 reads every field per the SDK docs
+    attr.voice = (u_long)(1UL << debug_voice);
+    attr.mask  = 0;
+    SpuGetVoiceAttr(&attr);
+
+    // Hardware ENVX register
+    live_env = spuReadEnvelope(debug_voice);
+
+    FntPrint("=== DEBUG: VOICE %02d ===\n\n", debug_voice);
+
+    // Volume channels
+    FntPrint("VOL  L:%6d R:%6d\n", attr.volume.left,  attr.volume.right);
+    FntPrint("VMOD L:%6d R:%6d\n", attr.volmode.left, attr.volmode.right);
+    FntPrint("VOLX L:%6d R:%6d\n", attr.volumex.left, attr.volumex.right);
+
+    // Pitch and envelope level
+    FntPrint("PITCH:0x%04X  ENVX:%5d\n", attr.pitch, attr.envx);
+    FntPrint("ENV(hw):0x%04X\n", live_env);
+
+    // Upper 8 bits = MIDI note, lower 8 bits = fine cents
+    midi_n = (attr.note >> 8) & 0xFF;
+    cent   =  attr.note       & 0xFF;
+    formatVoiceNote(midi_n, nstr);
+    FntPrint("NOTE: 0x%04X (%s +%d)\n", attr.note, nstr, cent);
+    FntPrint("SNOT: 0x%04X\n", attr.sample_note);
+
+    // Waveform addresses
+	// note: I guess this could be used to track the vags and know which tone is used to play a note
+	// to display the correct note in the SEQ player visualizer
+    FntPrint("ADDR: 0x%08X\n", (unsigned int)attr.addr);
+    FntPrint("LADR: 0x%08X\n", (unsigned int)attr.loop_addr);
+
+    // Envelope mode flags (0=lin-inc-norm, 1=lin-inc-rev, 2=exp-inc, 3=exp-dec)
+    FntPrint("AMOD:%ld SMOD:%ld RMOD:%ld\n", attr.a_mode, attr.s_mode, attr.r_mode);
+
+    // ADSR rate and level fields
+    FntPrint("AR:%3u DR:%3u SR:%3u\n", attr.ar, attr.dr, attr.sr);
+    FntPrint("RR:%3u SL:%3u\n",        attr.rr, attr.sl);
+
+    // Raw packed ADSR words (matches VagAtr adsr1/adsr2 layout)
+    FntPrint("ADSR1:0x%04X ADSR2:0x%04X\n", attr.adsr1, attr.adsr2);
+
+    if (vab_mode) {
+        FntPrint("\nTRI:PLAY(HOLD)  CIR:BACK  SEL+STA+L1+R1:BACK\n");
+    } else {
+        FntPrint("\nTRI:PLAY/STP  CIR:BACK  SEL+STA+L1+R1:BACK\n");
+    }
+}
+
+#endif // ENABLE_DEBUG_MENU
+
 void drawUI(void)
 {
 	#if HAS_BACKGROUND_IMAGE
@@ -3818,6 +4231,14 @@ void drawUI(void)
         case STATE_ADSR_EDIT:
             drawAdsrEdit();
             break;
+        case STATE_VISUALIZER:
+            drawVisualizer();
+            break;
+#ifdef ENABLE_DEBUG_MENU
+        case STATE_DEBUG:
+            drawDebug();
+            break;
+#endif
     }
 }
 
