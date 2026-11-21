@@ -172,7 +172,11 @@ endif
 all: fileconfig.h
 
 # Debug menu toggle, comment this line out to strip all debug-menu code
-# Defining it here instead of the source ensures the IDE linter sees it
-CPPFLAGS += -DENABLE_DEBUG_MENU
+#CPPFLAGS += -DENABLE_DEBUG_MENU
+
+# CD-ROM browser (Triangle on the first screen), comment this line out to strip it.
+# reserves CD_POOL_SIZE bytes of RAM (default 512 KB) for disc files.
+# To change the pool size add e.g.:  CPPFLAGS += -DCD_POOL_SIZE=262144
+CPPFLAGS += -DENABLE_CD_BROWSER
 
 include ../common.mk
