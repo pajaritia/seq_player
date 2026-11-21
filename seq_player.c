@@ -1,9 +1,9 @@
 // PS1 SEQ/VH/VB Player
 // Controller-driven UI for playing sequence files with soundbanks
-//
 // Based on nolibgs_hello_worlds SDK
 // Uses libsnd for sequence/VAB playback
-// Uses libsio for Serial MIDI input (VAB mode)
+// Uses the PicoDev PIO cartridge UART for MIDI input
+// Optional libcd CD-ROM browser to load SEQ/VH/VB files
 
 #include <sys/types.h>
 #include <stdio.h>
@@ -11,7 +11,9 @@
 #include <libgpu.h>
 #include <libsnd.h>
 #include <libspu.h>
-#include <libsio.h>
+#ifdef ENABLE_CD_BROWSER
+#include <libcd.h>
+#endif
 
 // Include auto-generated file configuration
 #include "fileconfig.h"
@@ -22,6 +24,10 @@
 
 // Debug menu is configured in the Makefile via CPPFLAGS += -DENABLE_DEBUG_MENU
 // Comment that line to remove debug from build
+
+#ifndef offsetof
+#define offsetof(t, f) ((unsigned long)&(((t*)0)->f))
+#endif
 
 DISPENV disp[2];
 DRAWENV draw[2];
@@ -38,6 +44,9 @@ typedef enum {
     STATE_TONE_EDIT,
     STATE_ADSR_EDIT,
     STATE_VISUALIZER,
+#ifdef ENABLE_CD_BROWSER
+    STATE_CD_BROWSER,
+#endif
 #ifdef ENABLE_DEBUG_MENU
     STATE_DEBUG
 #endif
@@ -83,6 +92,7 @@ typedef enum {
 } ProgramEditMenuItem;
 
 // Tone editor menu items
+// TONE_MENU_PRIOR..TONE_MENU_PBMAX must stay contiguous and in the same order as the tone_fields[] table below
 typedef enum {
     TONE_MENU_PROG,
     TONE_MENU_TONE_SEL,
@@ -102,7 +112,11 @@ typedef enum {
     TONE_MENU_ITEM_COUNT
 } ToneEditMenuItem;
 
+// Number of fields handled by the tone_fields[] table
+#define TONE_FIELD_COUNT (TONE_MENU_PBMAX - TONE_MENU_PRIOR + 1)
+
 // ADSR editor menu items
+// ADSR_MENU_ATTACK_RATE..ADSR_MENU_RELEASE_EXP index adsr_fields[]
 typedef enum {
     ADSR_MENU_ATTACK_RATE,
     ADSR_MENU_ATTACK_EXP,
@@ -134,6 +148,47 @@ typedef struct {
     int releaseExponential;  // 0 or 1
 } AdsrParams;
 
+// Table-driven tone fields (u_char members of VagAtr)
+// Indexed by (menu item - TONE_MENU_PRIOR)
+typedef struct {
+    const char* label;   // Shown in the tone editor
+    u_char      off;     // Byte offset inside VagAtr
+    u_char      max;     // Upper limit (MODE is a special case: 0=NORMAL, 4=REVERB)
+} ToneField;
+
+static const ToneField tone_fields[TONE_FIELD_COUNT] = {
+    { "PRIORITY", offsetof(VagAtr, prior),  15  },
+    { "MODE",     offsetof(VagAtr, mode),   4   },
+    { "VOL",      offsetof(VagAtr, vol),    127 },
+    { "PAN",      offsetof(VagAtr, pan),    127 },
+    { "CENTER",   offsetof(VagAtr, center), 127 },
+    { "SHIFT",    offsetof(VagAtr, shift),  127 },
+    { "MIN",      offsetof(VagAtr, min),    127 },
+    { "MAX",      offsetof(VagAtr, max),    127 },
+    { "PBMIN",    offsetof(VagAtr, pbmin),  127 },
+    { "PBMAX",    offsetof(VagAtr, pbmax),  127 }
+};
+
+// Table-driven ADSR fields (int members of AdsrParams)
+// Indexed by ADSR menu item. max == 1 for toggles
+typedef struct {
+    const char* label;
+    u_char      off;     // Byte offset inside AdsrParams
+    u_char      max;
+} AdsrField;
+
+static const AdsrField adsr_fields[ADSR_MENU_SAVE] = {
+    { "ATTACK RATE",   offsetof(AdsrParams, attack),             127 },
+    { "ATTACK EXP",    offsetof(AdsrParams, attackExponential),  1   },
+    { "DECAY RATE",    offsetof(AdsrParams, decay),              15  },
+    { "SUSTAIN LEVEL", offsetof(AdsrParams, sustainLevel),       15  },
+    { "SUSTAIN RATE",  offsetof(AdsrParams, sustain),            127 },
+    { "SUSTAIN SIGN",  offsetof(AdsrParams, sustainSigned),      1   },
+    { "SUSTAIN EXP",   offsetof(AdsrParams, sustainExponential), 1   },
+    { "RELEASE RATE",  offsetof(AdsrParams, release),            31  },
+    { "RELEASE EXP",   offsetof(AdsrParams, releaseExponential), 1   }
+};
+
 // File entry structure
 typedef struct {
     char name[32];
@@ -162,11 +217,23 @@ typedef struct {
 // MAX_SEQ_FILES and MAX_VH_FILES are defined there
 
 // File lists - initialized from generated macros
-FileEntry seq_files[MAX_SEQ_FILES] = SEQ_FILES_INIT;
+// Extra slots for files loaded from the CD-ROM browser
+#ifdef ENABLE_CD_BROWSER
+#define CD_MAX_LOADED 16
+#else
+#define CD_MAX_LOADED 0
+#endif
 
-FileEntry vh_files[MAX_VH_FILES] = VH_FILES_INIT;
+// The built-in files come first, CD-loaded files are appended
+FileEntry seq_files[MAX_SEQ_FILES + CD_MAX_LOADED] = SEQ_FILES_INIT;
 
-u_char* vb_files[MAX_VH_FILES] = VB_FILES_INIT;
+FileEntry vh_files[MAX_VH_FILES + CD_MAX_LOADED] = VH_FILES_INIT;
+
+u_char* vb_files[MAX_VH_FILES + CD_MAX_LOADED] = VB_FILES_INIT;
+
+// Total number of entries
+int seq_count = MAX_SEQ_FILES;
+int vh_count  = MAX_VH_FILES;
 
 // SEQ attribute table (required by libsnd)
 char seq_table[SS_SEQ_TABSIZ * MAX_SEQ_FILES * MAX_VH_FILES];
@@ -264,18 +331,33 @@ int hold_counter_down = 0;
 int hold_active_up = 0;
 int hold_active_down = 0;
 
-// Using 115200 for Baud Rate but can be changed, MIDI uses a different standard
-#define MIDI_BAUD            115200
-// Ring buffer size for MIDI = 2^6
-#define MIDI_RX_BUF_SIZE     64
+// Reworking of stuff:
+// Input and draw helper macros
+// LIST_ROWS: file list rows shown at once before the list scrolls
+#define LIST_ROWS       10
+// PRESSED(m): Frame at which button was pressed
+#define PRESSED(m)      (((pad) & (m)) && !((oldpad) & (m)))
+// CUR(i): Selection cursor glyph. '>' when i is selected, ' ' when not selected
+#define CUR(i)          ((menu_cursor == (i)) ? '>' : ' ')
+// SEL(i, s): string s when selected, "" when not selected
+#define SEL(i, s)       ((menu_cursor == (i)) ? (s) : "")
+// CHG(fn, i): " !" flag to report modified values
+#define CHG(fn, i)      (fn(i) ? " !" : "")
+
+// PicoDev PIO cartridge defs. UART channel (A1=1)
+#define PIO_BASE             0x1F000000
+#define PIO_UART_DATA        (*(volatile u_char*)(PIO_BASE + 2))
+#define PIO_UART_STATUS      (*(volatile u_char*)(PIO_BASE + 3))
+#define PIO_ST_UART_RXAVAIL  0x10   // bit 4: a byte is waiting
+#define PIO_ST_VALID_MASK    0xCC   // bits 7,6,3,2
+#define PIO_ST_VALID_VALUE   0x88   // configured=1, suspend=0 (firmware constants)
+#define MIDI_MAX_BYTES_PER_FRAME 128
+
+static int cartMidiAvailable(void) { return (PIO_UART_STATUS & PIO_ST_UART_RXAVAIL) != 0; }
+static u_char cartMidiRead(void)   { return PIO_UART_DATA; }
+
 // Midi message duration in frames
 #define MIDI_DISPLAY_FRAMES  180
-
-// Ring buffer written by the SIO ISR, drained by the main loop
-// volatile prevents the compiler from caching head/tail in registers
-static volatile u_char midi_rx_buf[MIDI_RX_BUF_SIZE];
-static volatile int    midi_rx_head = 0;   // ISR advances this
-static volatile int    midi_rx_tail = 0;   // main loop advances this
 
 // MIDI running-status parser (main-loop only, no volatile needed)
 static u_char midi_run_status = 0;
@@ -353,9 +435,40 @@ int isAdsrValueChanged(int menu_item);
 void drawDebug(void);
 #endif
 
+// New shared helpers for VAB handling, input, table-driven editing
+static void closeVab(void);
+static int  openVab(void);
+static void selectVhFile(int idx);
+static void addClamped(u_char* p, int delta, int max);
+static void toneEditProgramStep(int delta);
+static void adjustToneField(int item, int direction, int amount);
+static void toggleToneField(int item);
+static int* adsrFieldPtr(AdsrParams* p, int item);
+static void applyAdsrPreview(void);
+static int  repeatFire(int mask, int* cnt, int* active);
+static void navList(int count);
+static void navMenu(int count, int skip_item);
+static void editInput(void (*adjust)(int, int), void (*toggle)(void));
+static void handleTriangleNote(void);
+static int  clampi(int v, int lo, int hi);
+static void setReverbType(int v);
+static void setReverbDepth(int v);
+static void setReverbDelay(int v);
+static void setReverbFeedback(int v);
+static void adjustReverbParam(int param, int direction, int amount);
+static void toggleReverbParam(int param);
+static void drawReverbRows(int first_item);
+static int  inEditorState(void);
+static void activeProgTone(short* prog, short* tone);
+static void releaseMidiSlot(int i);
+static void listWindow(int count, int cur, int rows, int* top, int* end);
+static void drawFileList(const FileEntry* files, int count);
+#ifdef ENABLE_CD_BROWSER
+void drawCdBrowser(void);
+#endif
+
 // Serial MIDI functions
 static int  midiMsgLength(u_char status);
-static void sioRxIsr(void);
 void startSerialMidi(void);
 void stopSerialMidi(void);
 void processMidi(void);
@@ -488,6 +601,59 @@ void loadAudioFiles(void)
     current_audio.seq_id = -1;
 }
 
+// VAB open/close helpers
+static void closeVab(void)
+{
+    if (current_audio.vab_id >= 0) {
+        SsVabClose(current_audio.vab_id);
+        current_audio.vab_id = -1;
+    }
+}
+
+// Open the VAB for the currently selected VH/VB pair and transfer the body to SPU ram
+// Does nothing (returns 1) if a VAB is already loaded, so edits made in the program editor are preserved.
+// Returns 1 on success, 0 if failed
+static int openVab(void)
+{
+    if (current_audio.vab_id >= 0) return 1;
+    if (current_audio.vh_data == NULL) return 0;
+
+    // Open header
+    current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
+    if (current_audio.vab_id < 0) {
+        FntPrint("Failed to open VAB header!\n");
+        return 0;
+    }
+
+    // Transfer body
+    if (SsVabTransBody(current_audio.vb_data, current_audio.vab_id) != current_audio.vab_id) {
+        FntPrint("Failed to transfer VAB body!\n");
+        SsVabClose(current_audio.vab_id);
+        current_audio.vab_id = -1;
+        return 0;
+    }
+
+    // Wait for transfer to complete
+    SsVabTransCompleted(SS_WAIT_COMPLETED);
+    return 1;
+}
+
+// Point current_audio to VAB index and read header counts
+static void selectVhFile(int idx)
+{
+    VabHdr* vab_hdr;
+
+    current_audio.vh_data = vh_files[idx].data;
+    current_audio.vb_data = vb_files[idx];
+    current_audio.vh_size = vh_files[idx].size;
+    sprintf(current_audio.vh_name, "%s", vh_files[idx].name);
+
+    // Read VAB header (VabHdr struct)
+    vab_hdr = (VabHdr*)current_audio.vh_data;
+    current_audio.num_programs = vab_hdr->ps;  // Note: 'ps' not 'programs'
+    current_audio.num_tones = vab_hdr->ts;     // Note: 'ts' not 'tones'
+}
+
 void playSequence(void)
 {
     if (is_playing) {
@@ -498,30 +664,10 @@ void playSequence(void)
     current_tempo = 120;
     tempo_changed = 0;  // Mark as unchanged
     
-    // Check if VAB is already loaded from previous play or editing
-    // If so, reuse it to preserve any edits made in program editor
-    if (current_audio.vab_id < 0) {
-        // Open VAB header (VH)
-        current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
-        if (current_audio.vab_id < 0) {
-            FntPrint("Failed to open VAB header!\n");
-            return;
-        }
-        
-        // Transfer VAB body (VB) to SPU
-        if (SsVabTransBody(current_audio.vb_data, current_audio.vab_id) != current_audio.vab_id) {
-            FntPrint("Failed to transfer VAB body!\n");
-            SsVabClose(current_audio.vab_id);
-            current_audio.vab_id = -1;
-            return;
-        }
-        
-        // Wait for transfer to complete
-        SsVabTransCompleted(SS_WAIT_COMPLETED);
-    }
-    // If VAB is already loaded, we reuse it (preserves program edits)
+    // Load the VAB if not already loaded. Reusing an already loaded VAB preserves the changes made in program editor
+    if (!openVab()) return;
     
-    // Open sequence (cast to unsigned long* as required by API)
+    // Open SEQ (cast to unsigned long* as required by API)
     current_audio.seq_id = SsSeqOpen((unsigned long*)current_audio.seq_data, current_audio.vab_id);
     if (current_audio.seq_id < 0) {
         FntPrint("Failed to open sequence!\n");
@@ -589,6 +735,80 @@ const char* getReverbTypeName(short type)
     }
 }
 
+// Reverb param helpers
+// The two playback menus list the reverb rows in the same order, menu items are mapped to a parameter via offset from the first reverb row
+typedef enum {
+    REV_PARAM_TYPE,
+    REV_PARAM_DEPTH,
+    REV_PARAM_DELAY,
+    REV_PARAM_FEEDBACK
+} ReverbParam;
+
+// Array size becomes -1 (and compiler fails) if reverb rows and param order is not correct
+typedef char reverb_menu_order_check[
+    ((MENU_REV_DEPTH     - MENU_REV_TYPE) == REV_PARAM_DEPTH    &&
+     (MENU_REV_DELAY     - MENU_REV_TYPE) == REV_PARAM_DELAY    &&
+     (MENU_REV_FEEDBACK  - MENU_REV_TYPE) == REV_PARAM_FEEDBACK &&
+     (VAB_MENU_REV_DEPTH    - VAB_MENU_REV_TYPE) == REV_PARAM_DEPTH    &&
+     (VAB_MENU_REV_DELAY    - VAB_MENU_REV_TYPE) == REV_PARAM_DELAY    &&
+     (VAB_MENU_REV_FEEDBACK - VAB_MENU_REV_TYPE) == REV_PARAM_FEEDBACK) ? 1 : -1];
+
+static int clampi(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// Each setter clamps, stores and applies one reverb value. Also used by the NRPN handler in processMidi()
+static void setReverbType(int v)
+{
+    reverb_type = (short)clampi(v, 0, 9);
+    SsUtSetReverbType(reverb_type);
+    // Reapply reverb depth when changing type
+    SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
+}
+
+static void setReverbDepth(int v)
+{
+    reverb_depth_left = reverb_depth_right = (short)clampi(v, 0, 127);
+    SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
+}
+
+static void setReverbDelay(int v)
+{
+    reverb_delay = (short)clampi(v, 0, 127);
+    SsUtSetReverbDelay(reverb_delay);
+}
+
+static void setReverbFeedback(int v)
+{
+    reverb_feedback = (short)clampi(v, 0, 127);
+    SsUtSetReverbFeedback(reverb_feedback);
+}
+
+// direction: -1/+1, amount: step size (TYPE always steps by 1)
+static void adjustReverbParam(int param, int direction, int amount)
+{
+    switch (param) {
+        case REV_PARAM_TYPE:     setReverbType(reverb_type + direction);                   break;
+        case REV_PARAM_DEPTH:    setReverbDepth(reverb_depth_left + direction * amount);   break;
+        case REV_PARAM_DELAY:    setReverbDelay(reverb_delay + direction * amount);        break;
+        case REV_PARAM_FEEDBACK: setReverbFeedback(reverb_feedback + direction * amount);  break;
+    }
+}
+
+// Toggle min/max for reverb params
+static void toggleReverbParam(int param)
+{
+    switch (param) {
+        case REV_PARAM_TYPE:     setReverbType(reverb_type == 9 ? 0 : 9);                   break;
+        case REV_PARAM_DEPTH:    setReverbDepth(reverb_depth_left == 127 ? 0 : 127);        break;
+        case REV_PARAM_DELAY:    setReverbDelay(reverb_delay == 127 ? 0 : 127);             break;
+        case REV_PARAM_FEEDBACK: setReverbFeedback(reverb_feedback == 127 ? 0 : 127);       break;
+    }
+}
+
 void adjustMenuValue(int direction, int amount)
 {
     // direction: -1 for decrease, 1 for increase
@@ -610,41 +830,10 @@ void adjustMenuValue(int direction, int amount)
             }
             break;
             
-        case MENU_REV_TYPE:
-            reverb_type += direction;
-            if (reverb_type < 0) reverb_type = 0;
-            if (reverb_type > 9) reverb_type = 9;
-            SsUtSetReverbType(reverb_type);
-            // Reapply reverb depth when changing type
-            SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
-            break;
-            
-        case MENU_REV_DEPTH:
-            reverb_depth_left += (direction * amount);
-            reverb_depth_right += (direction * amount);
-            if (reverb_depth_left < 0) {
-                reverb_depth_left = 0;
-                reverb_depth_right = 0;
+        default:
+            if (menu_cursor >= MENU_REV_TYPE && menu_cursor <= MENU_REV_FEEDBACK) {
+                adjustReverbParam(menu_cursor - MENU_REV_TYPE, direction, amount);
             }
-            if (reverb_depth_left > 127) {
-                reverb_depth_left = 127;
-                reverb_depth_right = 127;
-            }
-            SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
-            break;
-            
-        case MENU_REV_DELAY:
-            reverb_delay += (direction * amount);
-            if (reverb_delay < 0) reverb_delay = 0;
-            if (reverb_delay > 127) reverb_delay = 127;
-            SsUtSetReverbDelay(reverb_delay);
-            break;
-            
-        case MENU_REV_FEEDBACK:
-            reverb_feedback += (direction * amount);
-            if (reverb_feedback < 0) reverb_feedback = 0;
-            if (reverb_feedback > 127) reverb_feedback = 127;
-            SsUtSetReverbFeedback(reverb_feedback);
             break;
     }
 }
@@ -664,31 +853,32 @@ void toggleMinMax(void)
             }
             break;
             
-        case MENU_REV_TYPE:
-            reverb_type = (reverb_type == 9) ? 0 : 9;
-            SsUtSetReverbType(reverb_type);
-            break;
-            
-        case MENU_REV_DEPTH:
-            if (reverb_depth_left == 127) {
-                reverb_depth_left = 0;
-                reverb_depth_right = 0;
-            } else {
-                reverb_depth_left = 127;
-                reverb_depth_right = 127;
+        default:
+            if (menu_cursor >= MENU_REV_TYPE && menu_cursor <= MENU_REV_FEEDBACK) {
+                toggleReverbParam(menu_cursor - MENU_REV_TYPE);
             }
-            SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
             break;
-            
-        case MENU_REV_DELAY:
-            reverb_delay = (reverb_delay == 127) ? 0 : 127;
-            SsUtSetReverbDelay(reverb_delay);
-            break;
-            
-        case MENU_REV_FEEDBACK:
-            reverb_feedback = (reverb_feedback == 127) ? 0 : 127;
-            SsUtSetReverbFeedback(reverb_feedback);
-            break;
+    }
+}
+
+// True while any editor is being displayed
+static int inEditorState(void)
+{
+    return current_state == STATE_PROGRAM_EDIT ||
+           current_state == STATE_TONE_EDIT    ||
+           current_state == STATE_ADSR_EDIT;
+}
+
+// Program/tone that notes should be played with: active edit (tone only in the Tone and ADSR editors) or otherwise current_program
+static void activeProgTone(short* prog, short* tone)
+{
+    if (inEditorState()) {
+        *prog = edit_program;
+        *tone = (current_state == STATE_TONE_EDIT ||
+                 current_state == STATE_ADSR_EDIT) ? edit_tone : 0;
+    } else {
+        *prog = current_program;
+        *tone = 0;
     }
 }
 
@@ -697,19 +887,8 @@ void playNote(void)
     short program_to_use;
     short tone_to_use;
     
-    // Use edit_program if in editor, otherwise use current_program
-    if (current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
-        program_to_use = edit_program;
-        // In Tone Editor and ADSR Editor, use the currently selected tone
-        if (current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
-            tone_to_use = edit_tone;
-        } else {
-            tone_to_use = 0;
-        }
-    } else {
-        program_to_use = current_program;
-        tone_to_use = 0;
-    }
+    // Use active tone/program if in editor, otherwise use current_program
+    activeProgTone(&program_to_use, &tone_to_use);
     
     // Stop any currently playing note
     if (note_playing && current_voice >= 0) {
@@ -733,19 +912,8 @@ void stopNote(void)
     short program_to_use;
     short tone_to_use;
     
-    // Use edit_program if in editor states, otherwise use current_program
-    if (current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
-        program_to_use = edit_program;
-        // In Tone Editor and ADSR Editor, use the currently selected tone
-        if (current_state == STATE_TONE_EDIT || current_state == STATE_ADSR_EDIT) {
-            tone_to_use = edit_tone;
-        } else {
-            tone_to_use = 0;
-        }
-    } else {
-        program_to_use = current_program;
-        tone_to_use = 0;
-    }
+    // Use active tone/program if in editor, otherwise use current_program
+    activeProgTone(&program_to_use, &tone_to_use);
     
     if (note_playing && current_voice >= 0) {
         // SsUtKeyOff(voice_channel, vab_id, program, tone, note)
@@ -784,41 +952,10 @@ void adjustVabMenuValue(int direction, int amount)
             }
             break;
             
-        case VAB_MENU_REV_TYPE:
-            reverb_type += direction;
-            if (reverb_type < 0) reverb_type = 0;
-            if (reverb_type > 9) reverb_type = 9;
-            SsUtSetReverbType(reverb_type);
-            // Reapply reverb depth when changing type
-            SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
-            break;
-            
-        case VAB_MENU_REV_DEPTH:
-            reverb_depth_left += (direction * amount);
-            reverb_depth_right += (direction * amount);
-            if (reverb_depth_left < 0) {
-                reverb_depth_left = 0;
-                reverb_depth_right = 0;
+        default:
+            if (menu_cursor >= VAB_MENU_REV_TYPE && menu_cursor <= VAB_MENU_REV_FEEDBACK) {
+                adjustReverbParam(menu_cursor - VAB_MENU_REV_TYPE, direction, amount);
             }
-            if (reverb_depth_left > 127) {
-                reverb_depth_left = 127;
-                reverb_depth_right = 127;
-            }
-            SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
-            break;
-            
-        case VAB_MENU_REV_DELAY:
-            reverb_delay += (direction * amount);
-            if (reverb_delay < 0) reverb_delay = 0;
-            if (reverb_delay > 127) reverb_delay = 127;
-            SsUtSetReverbDelay(reverb_delay);
-            break;
-            
-        case VAB_MENU_REV_FEEDBACK:
-            reverb_feedback += (direction * amount);
-            if (reverb_feedback < 0) reverb_feedback = 0;
-            if (reverb_feedback > 127) reverb_feedback = 127;
-            SsUtSetReverbFeedback(reverb_feedback);
             break;
     }
 }
@@ -834,30 +971,10 @@ void toggleVabMinMax(void)
             current_program = (current_program == current_audio.num_programs - 1) ? 0 : current_audio.num_programs - 1;
             break;
             
-        case VAB_MENU_REV_TYPE:
-            reverb_type = (reverb_type == 9) ? 0 : 9;
-            SsUtSetReverbType(reverb_type);
-            break;
-            
-        case VAB_MENU_REV_DEPTH:
-            if (reverb_depth_left == 127) {
-                reverb_depth_left = 0;
-                reverb_depth_right = 0;
-            } else {
-                reverb_depth_left = 127;
-                reverb_depth_right = 127;
+        default:
+            if (menu_cursor >= VAB_MENU_REV_TYPE && menu_cursor <= VAB_MENU_REV_FEEDBACK) {
+                toggleReverbParam(menu_cursor - VAB_MENU_REV_TYPE);
             }
-            SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
-            break;
-            
-        case VAB_MENU_REV_DELAY:
-            reverb_delay = (reverb_delay == 127) ? 0 : 127;
-            SsUtSetReverbDelay(reverb_delay);
-            break;
-            
-        case VAB_MENU_REV_FEEDBACK:
-            reverb_feedback = (reverb_feedback == 127) ? 0 : 127;
-            SsUtSetReverbFeedback(reverb_feedback);
             break;
     }
 }
@@ -869,13 +986,7 @@ void enterProgramEdit(void)
     
     // Ensure VAB is loaded
 	// if not already loaded, load it now
-    if (current_audio.vab_id < 0 && current_audio.vh_data != NULL) {
-        current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
-        if (current_audio.vab_id >= 0) {
-            SsVabTransBody(current_audio.vb_data, current_audio.vab_id);
-            SsVabTransCompleted(SS_WAIT_COMPLETED);
-        }
-    }
+    openVab();
     
     // Load VAB header to get master vol/pan
     VabHdr* vab_hdr = (VabHdr*)current_audio.vh_data;
@@ -938,6 +1049,25 @@ void saveToneData(void)
     SsUtSetVagAtr(current_audio.vab_id, edit_program, edit_tone, &current_vag_atr);
 }
 
+// Table-driven editing helpers
+// *p += delta, clamped to 0..max (uses int so u_char can't wrap)
+static void addClamped(u_char* p, int delta, int max)
+{
+    *p = (u_char)clampi((int)*p + delta, 0, max);
+}
+
+// Pointer to the u_char program-editor value of each menu item (NULL if none)
+static u_char* programFieldPtr(int menu_item)
+{
+    switch (menu_item) {
+        case PROG_MENU_PROG_VOL:    return &current_prog_atr.mvol;
+        case PROG_MENU_PROG_PAN:    return &current_prog_atr.mpan;
+        case PROG_MENU_MASTER_VOL:  return &vab_master_vol;
+        case PROG_MENU_MASTER_PAN:  return &vab_master_pan;
+        default:                    return NULL;
+    }
+}
+
 int isProgramValueChanged(int menu_item)
 {
     switch (menu_item) {
@@ -956,126 +1086,116 @@ int isProgramValueChanged(int menu_item)
 
 int isToneValueChanged(int menu_item)
 {
-    switch (menu_item) {
-        case TONE_MENU_PRIOR:
-            return current_vag_atr.prior != original_vag_atr.prior;
-        case TONE_MENU_MODE:
-            return current_vag_atr.mode != original_vag_atr.mode;
-        case TONE_MENU_VOL:
-            return current_vag_atr.vol != original_vag_atr.vol;
-        case TONE_MENU_PAN:
-            return current_vag_atr.pan != original_vag_atr.pan;
-        case TONE_MENU_CENTER:
-            return current_vag_atr.center != original_vag_atr.center;
-        case TONE_MENU_SHIFT:
-            return current_vag_atr.shift != original_vag_atr.shift;
-        case TONE_MENU_MIN:
-            return current_vag_atr.min != original_vag_atr.min;
-        case TONE_MENU_MAX:
-            return current_vag_atr.max != original_vag_atr.max;
-        case TONE_MENU_PBMIN:
-            return current_vag_atr.pbmin != original_vag_atr.pbmin;
-        case TONE_MENU_PBMAX:
-            return current_vag_atr.pbmax != original_vag_atr.pbmax;
-        case TONE_MENU_ADSR1:
-            return current_vag_atr.adsr1 != original_vag_atr.adsr1;
-        case TONE_MENU_ADSR2:
-            return current_vag_atr.adsr2 != original_vag_atr.adsr2;
-        default:
-            return 0;
-    }
+    int idx;
+
+    // ADSR words are u_short, everything else is in tone_fields[]
+    if (menu_item == TONE_MENU_ADSR1)
+        return current_vag_atr.adsr1 != original_vag_atr.adsr1;
+    if (menu_item == TONE_MENU_ADSR2)
+        return current_vag_atr.adsr2 != original_vag_atr.adsr2;
+
+    idx = menu_item - TONE_MENU_PRIOR;
+    if (idx < 0 || idx >= TONE_FIELD_COUNT) return 0;
+
+    return *((u_char*)&current_vag_atr  + tone_fields[idx].off) !=
+           *((u_char*)&original_vag_atr + tone_fields[idx].off);
 }
 
 void adjustProgramEditValue(int direction, int amount)
 {
-    switch (menu_cursor) {
-        case PROG_MENU_PROGRAM_SEL:
-            edit_program += direction;
-            if (edit_program < 0) edit_program = 0;
-            if (edit_program >= current_audio.num_programs) {
-                edit_program = current_audio.num_programs - 1;
-            }
-            loadProgramData();
-            saveProgramData();  // Apply previous changes
-            break;
-            
-        case PROG_MENU_PROG_VOL:
-            current_prog_atr.mvol += (direction * amount);
-            if (current_prog_atr.mvol > 127) current_prog_atr.mvol = 127;
-            saveProgramData();
-            break;
-            
-        case PROG_MENU_PROG_PAN:
-            current_prog_atr.mpan += (direction * amount);
-            if (current_prog_atr.mpan > 127) current_prog_atr.mpan = 127;
-            saveProgramData();
-            break;
-            
-        case PROG_MENU_MASTER_VOL:
-            vab_master_vol += (direction * amount);
-            if (vab_master_vol > 127) vab_master_vol = 127;
-            saveProgramData();
-            break;
-            
-        case PROG_MENU_MASTER_PAN:
-            vab_master_pan += (direction * amount);
-            if (vab_master_pan > 127) vab_master_pan = 127;
-            saveProgramData();
-            break;
+    u_char* p;
+
+    if (menu_cursor == PROG_MENU_PROGRAM_SEL) {
+        edit_program += direction;
+        if (edit_program < 0) edit_program = 0;
+        if (edit_program >= current_audio.num_programs) {
+            edit_program = current_audio.num_programs - 1;
+        }
+        loadProgramData();
+        saveProgramData();  // Apply previous changes
+        return;
+    }
+
+    p = programFieldPtr(menu_cursor);
+    if (p) {
+        addClamped(p, direction * amount, 127);
+        saveProgramData();
     }
 }
 
 void toggleProgramEditMinMax(void)
 {
-    switch (menu_cursor) {
-        case PROG_MENU_PROGRAM_SEL:
-            edit_program = (edit_program == current_audio.num_programs - 1) ? 0 : current_audio.num_programs - 1;
-            loadProgramData();
-            saveProgramData();
-            break;
-            
-        case PROG_MENU_PROG_VOL:
-            current_prog_atr.mvol = (current_prog_atr.mvol == 127) ? 0 : 127;
-            saveProgramData();
-            break;
-            
-        case PROG_MENU_PROG_PAN:
-            current_prog_atr.mpan = (current_prog_atr.mpan == 127) ? 0 : 127;
-            saveProgramData();
-            break;
-            
-        case PROG_MENU_MASTER_VOL:
-            vab_master_vol = (vab_master_vol == 127) ? 0 : 127;
-            saveProgramData();
-            break;
-            
-        case PROG_MENU_MASTER_PAN:
-            vab_master_pan = (vab_master_pan == 127) ? 0 : 127;
-            saveProgramData();
-            break;
+    u_char* p;
+
+    if (menu_cursor == PROG_MENU_PROGRAM_SEL) {
+        edit_program = (edit_program == current_audio.num_programs - 1) ? 0 : current_audio.num_programs - 1;
+        loadProgramData();
+        saveProgramData();
+        return;
     }
+
+    p = programFieldPtr(menu_cursor);
+    if (p) {
+        *p = (*p == 127) ? 0 : 127;
+        saveProgramData();
+    }
+}
+
+// Select prev/next program
+// Saves the current tone, then resets to tone 0 of the newly selected program
+static void toneEditProgramStep(int delta)
+{
+    saveToneData();
+
+    edit_program += delta;
+    if (edit_program < 0) edit_program = 0;
+    if (edit_program >= current_audio.num_programs) {
+        edit_program = current_audio.num_programs - 1;
+    }
+
+    loadProgramData();
+    edit_tone = 0;
+    loadToneData();
+}
+
+// Adjust the table-driven tone fields (TONE_MENU_PRIOR..TONE_MENU_PBMAX)
+static void adjustToneField(int item, int direction, int amount)
+{
+    const ToneField* f = &tone_fields[item - TONE_MENU_PRIOR];
+    u_char* p = (u_char*)&current_vag_atr + f->off;
+
+    if (item == TONE_MENU_MODE) {
+        // Toggle between 0 and 4 for Reverb
+        if (direction != 0) {
+            *p = (*p == 0) ? 4 : 0;
+        }
+    } else {
+        addClamped(p, direction * amount, f->max);
+    }
+    saveToneData();
+}
+
+// Toggle min/max
+static void toggleToneField(int item)
+{
+    const ToneField* f = &tone_fields[item - TONE_MENU_PRIOR];
+    u_char* p = (u_char*)&current_vag_atr + f->off;
+
+    if (item == TONE_MENU_MODE) {
+        *p = (*p == 0) ? 4 : 0;
+    } else {
+        *p = (*p == f->max) ? 0 : f->max;
+    }
+    saveToneData();
 }
 
 void adjustToneEditValue(int direction, int amount)
 {
     int was_playing = note_playing;
-    int temp_val;  // Use int for calculations to prevent wrap-around
     
     switch (menu_cursor) {
         case TONE_MENU_PROG:
-            // Save current tone data before changing program
-            saveToneData();
-            
-            edit_program += direction;
-            if (edit_program < 0) edit_program = 0;
-            if (edit_program >= current_audio.num_programs) {
-                edit_program = current_audio.num_programs - 1;
-            }
-            
-            // Load new program data and reset to tone 0
-            loadProgramData();
-            edit_tone = 0;
-            loadToneData();
+            toneEditProgramStep(direction);
             break;
             
         case TONE_MENU_TONE_SEL:
@@ -1098,89 +1218,15 @@ void adjustToneEditValue(int direction, int amount)
             }
             break;
             
-        case TONE_MENU_PRIOR:
-            temp_val = (int)current_vag_atr.prior + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 15) temp_val = 15;
-            current_vag_atr.prior = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_MODE:
-            // Toggle between 0 (normal) and 4 (reverb)
-            if (direction != 0) {
-                current_vag_atr.mode = (current_vag_atr.mode == 0) ? 4 : 0;
-            }
-            saveToneData();
-            break;
-            
-        case TONE_MENU_VOL:
-            temp_val = (int)current_vag_atr.vol + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.vol = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_PAN:
-            temp_val = (int)current_vag_atr.pan + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.pan = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_CENTER:
-            temp_val = (int)current_vag_atr.center + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.center = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_SHIFT:
-            temp_val = (int)current_vag_atr.shift + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.shift = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_MIN:
-            temp_val = (int)current_vag_atr.min + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.min = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_MAX:
-            temp_val = (int)current_vag_atr.max + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.max = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_PBMIN:
-            temp_val = (int)current_vag_atr.pbmin + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.pbmin = (u_char)temp_val;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_PBMAX:
-            temp_val = (int)current_vag_atr.pbmax + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_vag_atr.pbmax = (u_char)temp_val;
-            saveToneData();
-            break;
-            
         case TONE_MENU_ADSR1:
         case TONE_MENU_ADSR2:
             // ADSR values are edited with X button, not directional controls
+            break;
+
+        default:
+            if (menu_cursor >= TONE_MENU_PRIOR && menu_cursor <= TONE_MENU_PBMAX) {
+                adjustToneField(menu_cursor, direction, amount);
+            }
             break;
     }
 }
@@ -1208,66 +1254,20 @@ void toggleToneEditMinMax(void)
             }
             break;
             
-        case TONE_MENU_PRIOR:
-            current_vag_atr.prior = (current_vag_atr.prior == 15) ? 0 : 15;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_MODE:
-            current_vag_atr.mode = (current_vag_atr.mode == 0) ? 4 : 0;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_VOL:
-            current_vag_atr.vol = (current_vag_atr.vol == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_PAN:
-            current_vag_atr.pan = (current_vag_atr.pan == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_CENTER:
-            current_vag_atr.center = (current_vag_atr.center == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_SHIFT:
-            current_vag_atr.shift = (current_vag_atr.shift == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_MIN:
-            current_vag_atr.min = (current_vag_atr.min == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_MAX:
-            current_vag_atr.max = (current_vag_atr.max == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_PBMIN:
-            current_vag_atr.pbmin = (current_vag_atr.pbmin == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
-        case TONE_MENU_PBMAX:
-            current_vag_atr.pbmax = (current_vag_atr.pbmax == 127) ? 0 : 127;
-            saveToneData();
-            break;
-            
         case TONE_MENU_ADSR1:
         case TONE_MENU_ADSR2:
             // ADSR values edited with X button
             break;
+
+        default:
+            if (menu_cursor >= TONE_MENU_PRIOR && menu_cursor <= TONE_MENU_PBMAX) {
+                toggleToneField(menu_cursor);
+            }
+            break;
     }
 }
 
-// ====================
 // ADSR Editor Functions
-// ====================
 
 void decodeADSR(u_short adsr1, u_short adsr2, AdsrParams* params)
 {
@@ -1360,152 +1360,70 @@ void exitAdsrEdit(int save)
     }
 }
 
+// Pointer to the int member in AdsrParams for each ADSR menu item (0..ADSR_MENU_SAVE-1)
+static int* adsrFieldPtr(AdsrParams* p, int item)
+{
+    return (int*)((u_char*)p + adsr_fields[item].off);
+}
+
+// Encode current_adsr and apply to tone immediately for preview
+static void applyAdsrPreview(void)
+{
+    encodeADSR(&current_adsr, &current_vag_atr.adsr1, &current_vag_atr.adsr2);
+    saveToneData();
+}
+
 void adjustAdsrValue(int direction, int amount)
 {
+    const AdsrField* f;
+    int* p;
     int temp_val;
-    u_short temp_adsr1, temp_adsr2;
-    
-    switch (menu_cursor) {
-        case ADSR_MENU_ATTACK_RATE:
-            temp_val = current_adsr.attack + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_adsr.attack = temp_val;
-            break;
-            
-        case ADSR_MENU_ATTACK_EXP:
-            current_adsr.attackExponential = !current_adsr.attackExponential;
-            break;
-            
-        case ADSR_MENU_DECAY_RATE:
-            temp_val = current_adsr.decay + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 15) temp_val = 15;
-            current_adsr.decay = temp_val;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_LEVEL:
-            temp_val = current_adsr.sustainLevel + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 15) temp_val = 15;
-            current_adsr.sustainLevel = temp_val;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_RATE:
-            temp_val = current_adsr.sustain + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 127) temp_val = 127;
-            current_adsr.sustain = temp_val;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_SIGNED:
-            current_adsr.sustainSigned = !current_adsr.sustainSigned;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_EXP:
-            current_adsr.sustainExponential = !current_adsr.sustainExponential;
-            break;
-            
-        case ADSR_MENU_RELEASE_RATE:
-            temp_val = current_adsr.release + (direction * amount);
-            if (temp_val < 0) temp_val = 0;
-            if (temp_val > 31) temp_val = 31;
-            current_adsr.release = temp_val;
-            break;
-            
-        case ADSR_MENU_RELEASE_EXP:
-            current_adsr.releaseExponential = !current_adsr.releaseExponential;
-            break;
-            
-        case ADSR_MENU_SAVE:
-        case ADSR_MENU_CANCEL:
-            // No adjustment for action items
-            break;
+
+    // SAVE / CANCEL have no adjust
+    if (menu_cursor < 0 || menu_cursor >= ADSR_MENU_SAVE) return;
+
+    f = &adsr_fields[menu_cursor];
+    p = adsrFieldPtr(&current_adsr, menu_cursor);
+
+    if (f->max == 1) {
+        // ON/OFF flag
+        *p = !*p;
+    } else {
+        temp_val = *p + (direction * amount);
+        if (temp_val < 0) temp_val = 0;
+        if (temp_val > f->max) temp_val = f->max;
+        *p = temp_val;
     }
-    
-    // Apply changes immediately for preview
-    if (menu_cursor < ADSR_MENU_SAVE) {
-        encodeADSR(&current_adsr, &temp_adsr1, &temp_adsr2);
-        current_vag_atr.adsr1 = temp_adsr1;
-        current_vag_atr.adsr2 = temp_adsr2;
-        saveToneData();
-    }
+
+    // Apply changes immediately
+    applyAdsrPreview();
 }
 
 void toggleAdsrValue(void)
 {
-    switch (menu_cursor) {
-        case ADSR_MENU_ATTACK_RATE:
-            current_adsr.attack = (current_adsr.attack == 127) ? 0 : 127;
-            break;
-            
-        case ADSR_MENU_ATTACK_EXP:
-            current_adsr.attackExponential = !current_adsr.attackExponential;
-            break;
-            
-        case ADSR_MENU_DECAY_RATE:
-            current_adsr.decay = (current_adsr.decay == 15) ? 0 : 15;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_LEVEL:
-            current_adsr.sustainLevel = (current_adsr.sustainLevel == 15) ? 0 : 15;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_RATE:
-            current_adsr.sustain = (current_adsr.sustain == 127) ? 0 : 127;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_SIGNED:
-            current_adsr.sustainSigned = !current_adsr.sustainSigned;
-            break;
-            
-        case ADSR_MENU_SUSTAIN_EXP:
-            current_adsr.sustainExponential = !current_adsr.sustainExponential;
-            break;
-            
-        case ADSR_MENU_RELEASE_RATE:
-            current_adsr.release = (current_adsr.release == 31) ? 0 : 31;
-            break;
-            
-        case ADSR_MENU_RELEASE_EXP:
-            current_adsr.releaseExponential = !current_adsr.releaseExponential;
-            break;
+    const AdsrField* f;
+    int* p;
+
+    if (menu_cursor < 0 || menu_cursor >= ADSR_MENU_SAVE) return;
+
+    f = &adsr_fields[menu_cursor];
+    p = adsrFieldPtr(&current_adsr, menu_cursor);
+
+    if (f->max == 1) {
+        *p = !*p;
+    } else {
+        *p = (*p == f->max) ? 0 : f->max;
     }
-    
+
     // Apply changes immediately
-    if (menu_cursor < ADSR_MENU_SAVE) {
-        u_short temp_adsr1, temp_adsr2;
-        encodeADSR(&current_adsr, &temp_adsr1, &temp_adsr2);
-        current_vag_atr.adsr1 = temp_adsr1;
-        current_vag_atr.adsr2 = temp_adsr2;
-        saveToneData();
-    }
+    applyAdsrPreview();
 }
 
 int isAdsrValueChanged(int menu_item)
 {
-    switch (menu_item) {
-        case ADSR_MENU_ATTACK_RATE:
-            return current_adsr.attack != original_adsr.attack;
-        case ADSR_MENU_ATTACK_EXP:
-            return current_adsr.attackExponential != original_adsr.attackExponential;
-        case ADSR_MENU_DECAY_RATE:
-            return current_adsr.decay != original_adsr.decay;
-        case ADSR_MENU_SUSTAIN_LEVEL:
-            return current_adsr.sustainLevel != original_adsr.sustainLevel;
-        case ADSR_MENU_SUSTAIN_RATE:
-            return current_adsr.sustain != original_adsr.sustain;
-        case ADSR_MENU_SUSTAIN_SIGNED:
-            return current_adsr.sustainSigned != original_adsr.sustainSigned;
-        case ADSR_MENU_SUSTAIN_EXP:
-            return current_adsr.sustainExponential != original_adsr.sustainExponential;
-        case ADSR_MENU_RELEASE_RATE:
-            return current_adsr.release != original_adsr.release;
-        case ADSR_MENU_RELEASE_EXP:
-            return current_adsr.releaseExponential != original_adsr.releaseExponential;
-        default:
-            return 0;
-    }
+    if (menu_item < 0 || menu_item >= ADSR_MENU_SAVE) return 0;
+    return *adsrFieldPtr(&current_adsr, menu_item) !=
+           *adsrFieldPtr(&original_adsr, menu_item);
 }
 
 // Serial MIDI experiment :)
@@ -1521,24 +1439,6 @@ static int midiMsgLength(u_char status)
         type == 0xA0 || type == 0xB0 || type == 0xE0) return 3;
     // SysEx / System messages: treat as 1-byte (skip/ignore)
     return 1;
-}
-
-// SIO1 receive interrupt service routine
-// Drains the hardware RX register into the ring buffer, then clears the IRQ
-// Keep this short, it runs at interrupt level
-static void sioRxIsr(void)
-{
-    // SR_RXRDY is bit 1 of the driver status word
-    while (_sio_control(0, 0, 0) & 0x02) {
-        u_char b = (u_char)_sio_control(0, 4, 0);
-        int nxt = (midi_rx_head + 1) & (MIDI_RX_BUF_SIZE - 1);
-        if (nxt != midi_rx_tail) {      // drop byte only if buffer is full
-            midi_rx_buf[midi_rx_head] = b;
-            midi_rx_head = nxt;
-        }
-    }
-    // Clear interrupt and error flags so the next RX interrupt can fire
-    _sio_control(2, 1, 0);
 }
 
 // Polyphony Voice Pool
@@ -1561,6 +1461,23 @@ void initMidiVoices(void)
     }
 }
 
+// Key off the voice in pool slot i and remove the slot, shifting later slots down
+static void releaseMidiSlot(int i)
+{
+    int j;
+    SsUtKeyOff(midi_voices[i].voice_id,
+               current_audio.vab_id,
+               midi_voices[i].program,
+               midi_voices[i].tone,
+               midi_voices[i].note);
+    for (j = i; j < MIDI_MAX_VOICES - 1; j++) {
+        midi_voices[j] = midi_voices[j + 1];
+    }
+    midi_voices[MIDI_MAX_VOICES - 1].note     = -1;
+    midi_voices[MIDI_MAX_VOICES - 1].voice_id = -1;
+    if (midi_poly_count > 0) midi_poly_count--;
+}
+
 // Trigger a note from a MIDI NoteOn message
 // velocity is mapped 1-127 → 1-127 straight onto vol_left / vol_right
 // If all MIDI_MAX_VOICES slots are already occupied the oldest voice
@@ -1573,52 +1490,19 @@ void midiNoteOn(u_char note, u_char velocity)
     short new_voice;
 
     // Determine program/tone to use, respects editor state same as playNote
-    if (current_state == STATE_PROGRAM_EDIT ||
-        current_state == STATE_TONE_EDIT    ||
-        current_state == STATE_ADSR_EDIT) {
-        program_to_use = edit_program;
-        tone_to_use = (current_state == STATE_TONE_EDIT ||
-                       current_state == STATE_ADSR_EDIT) ? edit_tone : 0;
-    } else {
-        program_to_use = current_program;
-        tone_to_use    = 0;
-    }
+    activeProgTone(&program_to_use, &tone_to_use);
 
     // If this exact note is already playing retrigger it
     for (i = 0; i < MIDI_MAX_VOICES; i++) {
         if (midi_voices[i].note == (short)note) {
-            SsUtKeyOff(midi_voices[i].voice_id,
-                       current_audio.vab_id,
-                       midi_voices[i].program,
-                       midi_voices[i].tone,
-                       midi_voices[i].note);
-            // Remove this slot by shifting later slots down
-            int j;
-            for (j = i; j < MIDI_MAX_VOICES - 1; j++) {
-                midi_voices[j] = midi_voices[j + 1];
-            }
-            midi_voices[MIDI_MAX_VOICES - 1].note     = -1;
-            midi_voices[MIDI_MAX_VOICES - 1].voice_id = -1;
-            if (midi_poly_count > 0) midi_poly_count--;
+            releaseMidiSlot(i);
             break;
         }
     }
 
     // If all slots are full, steal the oldest (slot 0)
     if (midi_poly_count >= MIDI_MAX_VOICES) {
-        SsUtKeyOff(midi_voices[0].voice_id,
-                   current_audio.vab_id,
-                   midi_voices[0].program,
-                   midi_voices[0].tone,
-                   midi_voices[0].note);
-        // Shift all slots down to discard slot 0
-        int j;
-        for (j = 0; j < MIDI_MAX_VOICES - 1; j++) {
-            midi_voices[j] = midi_voices[j + 1];
-        }
-        midi_voices[MIDI_MAX_VOICES - 1].note     = -1;
-        midi_voices[MIDI_MAX_VOICES - 1].voice_id = -1;
-        midi_poly_count--;
+        releaseMidiSlot(0);
     }
 
     // Fire the new note with MIDI velocity as SPU volume
@@ -1661,19 +1545,7 @@ void midiNoteOff(u_char note)
     int i;
     for (i = 0; i < MIDI_MAX_VOICES; i++) {
         if (midi_voices[i].note == (short)note) {
-            SsUtKeyOff(midi_voices[i].voice_id,
-                       current_audio.vab_id,
-                       midi_voices[i].program,
-                       midi_voices[i].tone,
-                       midi_voices[i].note);
-            // Remove slot by shifting later slots down
-            int j;
-            for (j = i; j < MIDI_MAX_VOICES - 1; j++) {
-                midi_voices[j] = midi_voices[j + 1];
-            }
-            midi_voices[MIDI_MAX_VOICES - 1].note     = -1;
-            midi_voices[MIDI_MAX_VOICES - 1].voice_id = -1;
-            if (midi_poly_count > 0) midi_poly_count--;
+            releaseMidiSlot(i);
             break;
         }
     }
@@ -1707,59 +1579,43 @@ void midiAllNotesOff(void)
     }
 }
 
-// Open the SIO port at MIDI baud, configure 8-N-1, enable RX interrupt
+// Enable MIDI input from the PicoDev cartridge UART, drains stale bytes first
 // If serial MIDI is already running, calling this again toggles it off
 void startSerialMidi(void)
 {
-    if (serial_midi_enabled) {
-        stopSerialMidi();
+    int guard;
+    u_char st;
+
+    if (serial_midi_enabled) { stopSerialMidi(); return; }
+
+    // Sanity check: the cart always reports configured=1, suspend=0
+    st = PIO_UART_STATUS;
+    if ((st & PIO_ST_VALID_MASK) != PIO_ST_VALID_VALUE) {
+        sprintf(midi_last_msg, "No PIO cart? ST=%02X", st);
+        midi_msg_timer = MIDI_DISPLAY_FRAMES;
         return;
     }
 
-    AddSIO(MIDI_BAUD);
+    // The cart buffers up to 4 KB while MIDI is off
+    // Clear the buffer so stale bytes don't fire on enable.
+    for (guard = 0; guard < 6000 && cartMidiAvailable(); guard++)
+        (void)PIO_UART_DATA;
 
-    // Communications mode: 8-N-1
-    //   MR_CHLEN_8 = bits 3,2 = 11 = 0x0C   (8-bit character)
-    //   MR_SB_01   = bits 7,6 = 01 = 0x40   (1 stop bit)
-    //   bit 1 always 1         = 0x02
-    //   Result: 0x4E
-    _sio_control(1, 2, 0x4E);
-
-    // Control register: enable receive interrupt, receive, and transmit
-    //   CR_RXIEN = bit 11 = 0x800
-    //   CR_RXEN  = bit  2 = 0x004
-    //   CR_TXEN  = bit  0 = 0x001
-    //   Result: 0x805
-    _sio_control(1, 1, 0x805);
-
-    Sio1Callback(sioRxIsr);
-
-    // Reset ring buffer and parser state
-    midi_rx_head    = 0;
-    midi_rx_tail    = 0;
     midi_run_status = 0;
     midi_pbuf_pos   = 0;
     midi_pbuf_exp   = 0;
 
     serial_midi_enabled = 1;
-    sprintf(midi_last_msg, "Connected %d baud", MIDI_BAUD);
+    sprintf(midi_last_msg, "PIO UART ready");
     midi_msg_timer = MIDI_DISPLAY_FRAMES;
 }
 
-// Tear down the SIO port and clear all Serial MIDI state
 void stopSerialMidi(void)
 {
     if (!serial_midi_enabled) return;
-
-    Sio1Callback(0);        // remove ISR first so no more bytes arrive
-    _sio_control(1, 1, 0);  // disable all SIO control/interrupt bits
-    DelSIO();
-
-    // Silence every MIDI-triggered voice
     midiAllNotesOff();
-
     serial_midi_enabled = 0;
-    midi_pitch_bend     = 64;   // Reset to center
+    midi_pitch_bend = 64;
     midi_msg_timer = 0;
     midi_last_msg[0] = '\0';
 }
@@ -1834,16 +1690,16 @@ static void applyNrpnAdsr(short prog, int tone_num, u_char attr, u_char value)
     }
 }
 
-// Process all bytes currently sitting in the ring buffer
+// Process all bytes currently waiting in the cartridge UART
 // Call once per frame from processInput() before handling pad input
 void processMidi(void)
 {
     if (!serial_midi_enabled) return;
 
-    // Drain the ring buffer
-    while (midi_rx_tail != midi_rx_head) {
-        u_char b = midi_rx_buf[midi_rx_tail];
-        midi_rx_tail = (midi_rx_tail + 1) & (MIDI_RX_BUF_SIZE - 1);
+    // Drain the cartridge UART per frame bound
+	int budget = MIDI_MAX_BYTES_PER_FRAME;
+	while (budget-- > 0 && cartMidiAvailable()) {
+        u_char b = cartMidiRead();
 
         if (b & 0x80) {
             // Status byte
@@ -1903,9 +1759,7 @@ void processMidi(void)
                     if (new_prog < (short)current_audio.num_programs) {
                         current_program = new_prog;
                         // Sync editor program selector when in edit screens
-                        if (current_state == STATE_PROGRAM_EDIT ||
-                            current_state == STATE_TONE_EDIT    ||
-                            current_state == STATE_ADSR_EDIT) {
+                        if (inEditorState()) {
                             edit_program = new_prog;
                             loadProgramData();
                         }
@@ -1943,28 +1797,21 @@ void processMidi(void)
                             // Reverb and echo settings
                             switch (n_attr) {
                                 case 15: // Reverb type 0-9
-                                    reverb_type = (short)d2;
-                                    if (reverb_type > 9) reverb_type = 9;
-                                    SsUtSetReverbType(reverb_type);
-                                    SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
+                                    setReverbType((int)d2);
                                     sprintf(midi_last_msg, "NRPN RevType:%s",
                                             getReverbTypeName(reverb_type));
                                     break;
                                 case 16: // Reverb depth 0-127
-                                    reverb_depth_left  = (short)d2;
-                                    reverb_depth_right = (short)d2;
-                                    SsUtSetReverbDepth(reverb_depth_left, reverb_depth_right);
+                                    setReverbDepth((int)d2);
                                     sprintf(midi_last_msg, "NRPN RevDepth:%3d", d2);
                                     break;
                                 case 17: // Echo feedback 0-127
-                                    reverb_feedback = (short)d2;
-                                    SsUtSetReverbFeedback(reverb_feedback);
+                                    setReverbFeedback((int)d2);
                                     sprintf(midi_last_msg, "NRPN Feedback:%3d", d2);
                                     break;
                                 case 18: // Echo delay time 0-127
                                 case 19: // Delay time 0-127
-                                    reverb_delay = (short)d2;
-                                    SsUtSetReverbDelay(reverb_delay);
+                                    setReverbDelay((int)d2);
                                     sprintf(midi_last_msg, "NRPN Delay:   %3d", d2);
                                     break;
                             }
@@ -1974,9 +1821,7 @@ void processMidi(void)
                                    current_audio.vab_id >= 0) {
 
                             // ADSR parameter for a specific tone (0-15) or all tones (16)
-                            short cc_prog = (current_state == STATE_PROGRAM_EDIT ||
-                                             current_state == STATE_TONE_EDIT    ||
-                                             current_state == STATE_ADSR_EDIT)
+                            short cc_prog = (inEditorState())
                                             ? (short)edit_program
                                             : (short)current_program;
 
@@ -2001,9 +1846,7 @@ void processMidi(void)
                     if (current_audio.vab_id < 0) break;
 
                     // Target Editor program if in Editor
-                    short cc_prog = (current_state == STATE_PROGRAM_EDIT ||
-                                     current_state == STATE_TONE_EDIT    ||
-                                     current_state == STATE_ADSR_EDIT)
+                    short cc_prog = (inEditorState())
                                     ? (short)edit_program
                                     : (short)current_program;
 
@@ -2015,9 +1858,7 @@ void processMidi(void)
                                 pa.mvol = (u_char)d2;
                                 SsUtSetProgAtr(current_audio.vab_id, cc_prog, &pa);
                                 // Keep editor struct in sync so UI reflects the change
-                                if (current_state == STATE_PROGRAM_EDIT ||
-                                    current_state == STATE_TONE_EDIT    ||
-                                    current_state == STATE_ADSR_EDIT) {
+                                if (inEditorState()) {
                                     current_prog_atr.mvol = pa.mvol;
                                 }
                                 sprintf(midi_last_msg, "CC Vol  P%3d V%3d CH%2d",
@@ -2025,9 +1866,7 @@ void processMidi(void)
                             } else {            // CC 10: Pan
                                 pa.mpan = (u_char)d2;
                                 SsUtSetProgAtr(current_audio.vab_id, cc_prog, &pa);
-                                if (current_state == STATE_PROGRAM_EDIT ||
-                                    current_state == STATE_TONE_EDIT    ||
-                                    current_state == STATE_ADSR_EDIT) {
+                                if (inEditorState()) {
                                     current_prog_atr.mpan = pa.mpan;
                                 }
                                 sprintf(midi_last_msg, "CC Pan  P%3d V%3d CH%2d",
@@ -2078,6 +1917,566 @@ void processMidi(void)
     if (midi_msg_timer > 0) midi_msg_timer--;
 }
 
+// Input helpers
+
+// Hold-repeat logic for one button. Call once per frame per button with that button's own counters.
+// Returns 1 on the initial press, then again every HOLD_REPEAT_RATE frames once the button has been held for HOLD_THRESHOLD frames.
+static int repeatFire(int mask, int* cnt, int* active)
+{
+    if (pad & mask) {
+        (*cnt)++;
+        if (!(oldpad & mask)) {
+            // Initial press
+            *cnt = 0;
+            *active = 0;
+            return 1;
+        } else if (*cnt >= HOLD_THRESHOLD && !*active) {
+            // Hold threshold reached
+            *active = 1;
+        } else if (*active && (*cnt % HOLD_REPEAT_RATE == 0)) {
+            // Continuous repeat while held
+            return 1;
+        }
+    } else {
+        *cnt = 0;
+        *active = 0;
+    }
+    return 0;
+}
+
+// D-Pad Up/Down on a file list (uses 'cursor')
+static void navList(int count)
+{
+    if (PRESSED(PADLup)) {
+        cursor--;
+        if (cursor < 0) cursor = count - 1;
+    }
+    if (PRESSED(PADLdown)) {
+        cursor++;
+        if (cursor >= count) cursor = 0;
+    }
+}
+
+// D-Pad Up/Down on a menu with hold-repeat (uses 'menu_cursor')
+// skip_item: menu item the cursor must never rest on, or -1 for none
+static void navMenu(int count, int skip_item)
+{
+    if (repeatFire(PADLup, &hold_counter_up, &hold_active_up)) {
+        do {
+            menu_cursor--;
+            if (menu_cursor < 0) menu_cursor = count - 1;
+        } while (menu_cursor == skip_item);
+    }
+    if (repeatFire(PADLdown, &hold_counter_down, &hold_active_down)) {
+        do {
+            menu_cursor++;
+            if (menu_cursor >= count) menu_cursor = 0;
+        } while (menu_cursor == skip_item);
+    }
+}
+
+// Value editing controls for editor screens
+// Square = min/max toggle, L1/R1 = -10/+10, D-Pad Left/Right = -1/+1 with hold-repeat
+static void editInput(void (*adjust)(int, int), void (*toggle)(void))
+{
+    if (PRESSED(PADRleft)) toggle();
+    if (PRESSED(PADL1))    adjust(-1, 10);
+    if (PRESSED(PADR1))    adjust(1, 10);
+
+    if (repeatFire(PADLleft,  &hold_counter_left,  &hold_active_left))  adjust(-1, 1);
+    if (repeatFire(PADLright, &hold_counter_right, &hold_active_right)) adjust(1, 1);
+}
+
+// Triangle plays a note while held in VAB mode, always works even when Select is held to avoid notes getting stuck ON
+static void handleTriangleNote(void)
+{
+    if (pad & PADRup) {
+        if (!(oldpad & PADRup)) {
+            playNote();
+        }
+    } else if (oldpad & PADRup) {
+        stopNote();
+    }
+}
+
+#ifdef ENABLE_CD_BROWSER
+// CD-ROM browser
+// Reads the /SEQ and /VAB folders in the disc root, lists their files and loads the selected file into a static RAM pool.
+// Loaded files are appended to seq_files[] / vh_files[] / vb_files[] so the normal SEQ and VH select screens list them like the built-in ones.
+// /SEQ/*.SEQ        loaded as SEQ files
+// /VAB/NAME.VH+VB   loading either half loads the pair, both files must exist
+
+#ifndef CD_POOL_SIZE
+#define CD_POOL_SIZE      (512 * 1024)   // RAM reserved for files loaded from CD
+#endif
+#define CD_MAX_ENTRIES    32             // files listed per folder
+#define CD_NAME_LEN       24             // longest file name kept (incl. NUL)
+#define CD_SECTOR         2048
+#define CD_DIRBUF_SECTORS 4              // directory sectors read per folder
+#define CD_LIST_ROWS      8              // rows shown at once in the browser
+
+typedef struct {
+    char   name[CD_NAME_LEN];
+    u_long lba;
+    u_long size;
+} CdEntry;
+
+typedef struct {
+    CdEntry entry[CD_MAX_ENTRIES];
+    int     count;
+} CdFolder;
+
+typedef enum { CD_ACT_NONE, CD_ACT_SCAN, CD_ACT_LOAD } CdAction;
+
+static const char* const cd_folder_names[2] = { "SEQ", "VAB" };
+static CdFolder cd_folder[2];
+static int      cd_folder_sel   = 0;     // 0 = SEQ, 1 = VAB
+static int      cd_cursor       = 0;
+static int      cd_saved_cursor = 0;     // SEQ list cursor to restore on exit
+static int      cd_inited       = 0;
+static CdAction cd_action       = CD_ACT_NONE;
+static char     cd_status[40]   = "";
+static u_int    cd_pool_used    = 0;
+static u_long   cd_pool[CD_POOL_SIZE / 4];
+static u_long   cd_dirbuf[(CD_DIRBUF_SECTORS * CD_SECTOR) / 4];
+
+static u_long cdRead32(const u_char* p)
+{
+    return (u_long)p[0] | ((u_long)p[1] << 8) | ((u_long)p[2] << 16) | ((u_long)p[3] << 24);
+}
+
+static int cdLower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+// Case-insensitive string compare, 1 if equal
+static int cdNameEq(const char* a, const char* b)
+{
+    while (*a && *b) {
+        if (cdLower(*a) != cdLower(*b)) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+// Read nsec sectors starting at ISO9660 sector lba into buf with 3 retry attempts
+static int cdReadSectors(u_long lba, u_int nsec, void* buf)
+{
+    CdlLOC loc;
+    int tries;
+
+    for (tries = 0; tries < 3; tries++) {
+        CdIntToPos((int)lba, &loc);
+        CdControlB(CdlSetloc, (u_char*)&loc, 0);
+        if (CdRead((int)nsec, (u_long*)buf, CdlModeSpeed) && CdReadSync(0, 0) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Init libcd the first time the browser needs it
+static int cdEnsureInit(void)
+{
+    if (!cd_inited) {
+        if (!CdInit()) return 0;
+        cd_inited = 1;
+    }
+    return 1;
+}
+
+// Read (up to CD_DIRBUF_SECTORS of) a directory into cd_dirbuf
+// Returns the number of bytes read, 0 on failure
+static u_int cdReadDir(u_long lba, u_long size)
+{
+    u_int nsec = (u_int)(size / CD_SECTOR) + ((size % CD_SECTOR) ? 1 : 0);
+    if (nsec == 0) nsec = 1;
+    if (nsec > CD_DIRBUF_SECTORS) nsec = CD_DIRBUF_SECTORS;
+    if (!cdReadSectors(lba, nsec, cd_dirbuf)) return 0;
+    return nsec * CD_SECTOR;
+}
+
+// Step through ISO9660 directory records in buf. Returns the next record or NULL at the end.
+// Records never cross a sector boundary; a zero length byte means skip to the next sector
+static const u_char* cdNextRecord(const u_char* buf, u_int bytes, u_int* off)
+{
+    while (*off < bytes) {
+        const u_char* r = buf + *off;
+        u_int len = r[0];
+        if (len == 0) {
+            *off = (*off | (CD_SECTOR - 1)) + 1;
+            continue;
+        }
+        if (len < 34 || *off + len > bytes) return NULL;
+        *off += len;
+        return r;
+    }
+    return NULL;
+}
+
+// Copy the name of directory record r into out without the ";1" version and without a trailing '.'
+// Returns 0 for "." / ".." or names that are too long
+static int cdRecordName(const u_char* r, char* out)
+{
+    u_int nlen = r[32];
+    const u_char* n = r + 33;
+    u_int i;
+
+    if (nlen == 1 && (n[0] == 0 || n[0] == 1)) return 0;
+    for (i = 0; i < nlen && n[i] != ';'; i++) {
+        if (i >= CD_NAME_LEN - 1) return 0;
+        out[i] = (char)n[i];
+    }
+    if (i > 0 && out[i - 1] == '.') i--;
+    out[i] = '\0';
+    return i > 0;
+}
+
+// Read cdrom: find /SEQ and /VAB in the root directory and list their files
+static int cdScan(void)
+{
+    u_char* buf = (u_char*)cd_dirbuf;
+    const u_char* r;
+    u_long dir_lba[2]  = { 0, 0 };
+    u_long dir_size[2] = { 0, 0 };
+    int    found[2]    = { 0, 0 };
+    char   name[CD_NAME_LEN];
+    u_long root_lba, root_size;
+    u_int  bytes, off;
+    int    f;
+
+    cd_folder[0].count = 0;
+    cd_folder[1].count = 0;
+
+    if (!cdEnsureInit()) {
+        sprintf(cd_status, "CD INIT FAILED");
+        return 0;
+    }
+
+    // Primary volume descriptor at sector 16 holds the root dir record
+    if (!cdReadSectors(16, 1, cd_dirbuf) ||
+        buf[0] != 1 || buf[1] != 'C' || buf[2] != 'D' ||
+        buf[3] != '0' || buf[4] != '0' || buf[5] != '1') {
+        sprintf(cd_status, "NO DISC / NOT ISO9660");
+        return 0;
+    }
+    root_lba  = cdRead32(buf + 156 + 2);
+    root_size = cdRead32(buf + 156 + 10);
+
+    bytes = cdReadDir(root_lba, root_size);
+    if (!bytes) {
+        sprintf(cd_status, "ROOT DIR READ ERROR");
+        return 0;
+    }
+
+    // Find the SEQ and VAB dirs in the root
+    off = 0;
+    while ((r = cdNextRecord(buf, bytes, &off)) != NULL) {
+        if ((r[25] & 2) && cdRecordName(r, name)) {
+            for (f = 0; f < 2; f++) {
+                if (cdNameEq(name, cd_folder_names[f])) {
+                    dir_lba[f]  = cdRead32(r + 2);
+                    dir_size[f] = cdRead32(r + 10);
+                    found[f]    = 1;
+                }
+            }
+        }
+    }
+
+    // List the files of each folder that exists
+    for (f = 0; f < 2; f++) {
+        if (!found[f]) continue;
+        bytes = cdReadDir(dir_lba[f], dir_size[f]);
+        if (!bytes) continue;
+
+        off = 0;
+        while ((r = cdNextRecord(buf, bytes, &off)) != NULL) {
+            if (!(r[25] & 2) && cdRecordName(r, name) &&
+                cd_folder[f].count < CD_MAX_ENTRIES) {
+                CdEntry* e = &cd_folder[f].entry[cd_folder[f].count++];
+                sprintf(e->name, "%s", name);
+                e->lba  = cdRead32(r + 2);
+                e->size = cdRead32(r + 10);
+            }
+        }
+    }
+
+    if (!found[0] && !found[1]) {
+        sprintf(cd_status, "NO SEQ OR VAB FOLDER");
+    } else {
+        sprintf(cd_status, "SEQ:%d  VAB:%d FILES", cd_folder[0].count, cd_folder[1].count);
+    }
+    return 1;
+}
+
+// Index in files whose name matches, or -1
+static int cdFindLoaded(const FileEntry* files, int first, int count, const char* name)
+{
+    int i;
+    for (i = first; i < count; i++) {
+        if (cdNameEq(files[i].name, name)) return i;
+    }
+    return -1;
+}
+
+// Entry in folder f with the given name, or NULL
+static const CdEntry* cdFindEntry(const CdFolder* f, const char* name)
+{
+    int i;
+    for (i = 0; i < f->count; i++) {
+        if (cdNameEq(f->entry[i].name, name)) return &f->entry[i];
+    }
+    return NULL;
+}
+
+// Split "NAME.EXT" into base (copied to base) and extension pointer
+// Returns NULL if the name has no extension
+static const char* cdSplitName(const char* name, char* base)
+{
+    const char* dot = NULL;
+    const char* p;
+    int n;
+
+    for (p = name; *p; p++) {
+        if (*p == '.') dot = p;
+    }
+    if (!dot) return NULL;
+    n = (int)(dot - name);
+    if (n >= CD_NAME_LEN) n = CD_NAME_LEN - 1;
+    for (p = name; p < name + n; p++) base[p - name] = *p;
+    base[n] = '\0';
+    return dot + 1;
+}
+
+// Check if folder is already loaded into RAM
+static int cdEntryLoaded(int folder, const CdEntry* e)
+{
+    char base[CD_NAME_LEN];
+    char key[40];
+    const char* ext;
+
+    if (folder == 0) {
+        sprintf(key, "CD:%s", e->name);
+        return cdFindLoaded(seq_files, MAX_SEQ_FILES, seq_count, key) >= 0;
+    }
+    ext = cdSplitName(e->name, base);
+    if (!ext || !(cdNameEq(ext, "VH") || cdNameEq(ext, "VB"))) return 0;
+    sprintf(key, "CD:%s.VH", base);
+    return cdFindLoaded(vh_files, MAX_VH_FILES, vh_count, key) >= 0;
+}
+
+// Read an entry into the next free part of the RAM pool.
+// Returns the buffer, or NULL with cd_status set
+static u_char* cdLoadEntry(const CdEntry* e)
+{
+    u_int sectors = (u_int)(e->size / CD_SECTOR) + ((e->size % CD_SECTOR) ? 1 : 0);
+    u_int bytes   = sectors * CD_SECTOR;
+    u_char* dst;
+
+    if (sectors == 0) {
+        sprintf(cd_status, "EMPTY FILE");
+        return NULL;
+    }
+    if (bytes > CD_POOL_SIZE - cd_pool_used) {
+        sprintf(cd_status, "NO RAM: NEED %dK FREE", (int)(bytes / 1024));
+        return NULL;
+    }
+    dst = (u_char*)cd_pool + cd_pool_used;
+    if (!cdReadSectors(e->lba, sectors, dst)) {
+        sprintf(cd_status, "READ ERROR");
+        return NULL;
+    }
+    cd_pool_used += bytes;
+    return dst;
+}
+
+static void cdLoadSeq(const CdEntry* e)
+{
+    char name[32];
+    u_char* d;
+    u_int mark = cd_pool_used;
+
+    sprintf(name, "CD:%s", e->name);
+    if (cdFindLoaded(seq_files, MAX_SEQ_FILES, seq_count, name) >= 0) {
+        sprintf(cd_status, "ALREADY LOADED");
+        return;
+    }
+    if (seq_count >= MAX_SEQ_FILES + CD_MAX_LOADED) {
+        sprintf(cd_status, "SEQ LIST FULL");
+        return;
+    }
+    d = cdLoadEntry(e);
+    if (!d) return;
+
+    // SEQ files start with "pQES"
+    if (!(d[0] == 'p' && d[1] == 'Q' && d[2] == 'E' && d[3] == 'S')) {
+        cd_pool_used = mark;
+        sprintf(cd_status, "NOT A SEQ FILE");
+        return;
+    }
+
+    sprintf(seq_files[seq_count].name, "%s", name);
+    seq_files[seq_count].data = d;
+    seq_files[seq_count].size = e->size;
+    seq_files[seq_count].type = 0;
+    seq_count++;
+    sprintf(cd_status, "LOADED %dK", (int)((e->size + 1023) / 1024));
+}
+
+// Load the selected entry VH + VB pair
+static void cdLoadVab(const CdEntry* sel)
+{
+    char base[CD_NAME_LEN];
+    char want[CD_NAME_LEN + 4];
+    char name[32];
+    const char* ext;
+    const CdEntry *vh, *vb;
+    u_char *vhp, *vbp;
+    u_int mark = cd_pool_used;
+    VabHdr* hdr;
+
+    ext = cdSplitName(sel->name, base);
+    if (!ext || !(cdNameEq(ext, "VH") || cdNameEq(ext, "VB"))) {
+        sprintf(cd_status, "NOT A VH/VB FILE");
+        return;
+    }
+
+    sprintf(want, "%s.VH", base);
+    vh = cdFindEntry(&cd_folder[1], want);
+    sprintf(want, "%s.VB", base);
+    vb = cdFindEntry(&cd_folder[1], want);
+    if (!vh) { sprintf(cd_status, "MISSING %s.VH", base); return; }
+    if (!vb) { sprintf(cd_status, "MISSING %s.VB", base); return; }
+
+    sprintf(name, "CD:%s", vh->name);
+    if (cdFindLoaded(vh_files, MAX_VH_FILES, vh_count, name) >= 0) {
+        sprintf(cd_status, "ALREADY LOADED");
+        return;
+    }
+    if (vh_count >= MAX_VH_FILES + CD_MAX_LOADED) {
+        sprintf(cd_status, "VH LIST FULL");
+        return;
+    }
+
+    vhp = cdLoadEntry(vh);
+    if (!vhp) return;
+    vbp = cdLoadEntry(vb);
+    if (!vbp) {
+        cd_pool_used = mark;     // give back the VH too
+        return;
+    }
+
+    // Check VAB header pVAB
+    if (!(vhp[0] == 'p' && vhp[1] == 'B' && vhp[2] == 'A' && vhp[3] == 'V')) {
+        cd_pool_used = mark;
+        sprintf(cd_status, "NOT A VH FILE");
+        return;
+    }
+
+    hdr = (VabHdr*)vhp;
+    sprintf(vh_files[vh_count].name, "%s", name);
+    vh_files[vh_count].data = vhp;
+    vh_files[vh_count].size = hdr->fsize;
+    vh_files[vh_count].type = 1;
+    vb_files[vh_count]      = vbp;
+    vh_count++;
+    sprintf(cd_status, "LOADED %dK+%dK", (int)((vh->size + 1023) / 1024), (int)((vb->size + 1023) / 1024));
+}
+
+// Load selection
+static void cdLoadSelected(void)
+{
+    const CdFolder* f = &cd_folder[cd_folder_sel];
+
+    if (cd_cursor < 0 || cd_cursor >= f->count) return;
+    if (cd_folder_sel == 0) {
+        cdLoadSeq(&f->entry[cd_cursor]);
+    } else {
+        cdLoadVab(&f->entry[cd_cursor]);
+    }
+}
+
+// Forget every file loaded from CD and free the pool
+// Only reachable from the browser, which is only entered from the SEQ list where no VAB or sequence is using that memory
+static void cdUnloadAll(void)
+{
+    if (is_playing) stopSequence();
+    closeVab();
+    cd_pool_used = 0;
+    seq_count = MAX_SEQ_FILES;
+    vh_count  = MAX_VH_FILES;
+    sprintf(cd_status, "UNLOADED ALL CD FILES");
+}
+
+static void enterCdBrowser(void)
+{
+    cd_saved_cursor = cursor;
+    cd_cursor       = 0;
+    cd_folder_sel   = 0;
+    sprintf(cd_status, "READING DISC...");
+    cd_action       = CD_ACT_SCAN;     // runs next frame, after the message is drawn
+    current_state   = STATE_CD_BROWSER;
+}
+
+static void cdBrowserInput(void)
+{
+    const CdFolder* f;
+
+    // Slow actions (disc reads) are queued by the previous frame so that the "working" message has been drawn before the read blocks
+    if (cd_action != CD_ACT_NONE) {
+        CdAction act = cd_action;
+        cd_action = CD_ACT_NONE;
+        if (act == CD_ACT_SCAN) {
+            cdScan();
+            cd_cursor = 0;
+        } else {
+            cdLoadSelected();
+        }
+        return;
+    }
+
+    f = &cd_folder[cd_folder_sel];
+
+    // D-Pad Up/Down with hold-repeat
+    if (repeatFire(PADLup, &hold_counter_up, &hold_active_up) && f->count > 0) {
+        cd_cursor--;
+        if (cd_cursor < 0) cd_cursor = f->count - 1;
+    }
+    if (repeatFire(PADLdown, &hold_counter_down, &hold_active_down) && f->count > 0) {
+        cd_cursor++;
+        if (cd_cursor >= f->count) cd_cursor = 0;
+    }
+
+    // L1/R1 or D-Pad Left/Right switch between the SEQ and VAB folder
+    if (PRESSED(PADL1) || PRESSED(PADR1) || PRESSED(PADLleft) || PRESSED(PADLright)) {
+        cd_folder_sel ^= 1;
+        cd_cursor = 0;
+    }
+
+    // X - load the selected file
+    if (PRESSED(PADRdown) && f->count > 0) {
+        sprintf(cd_status, "LOADING...");
+        cd_action = CD_ACT_LOAD;
+    }
+
+    // Square - unload everything that came from the CD
+    if (PRESSED(PADRleft)) {
+        cdUnloadAll();
+    }
+
+    // Start - rescan the disc
+    if (PRESSED(PADstart)) {
+        sprintf(cd_status, "READING DISC...");
+        cd_action = CD_ACT_SCAN;
+    }
+
+    // Circle - back to the SEQ list
+    if (PRESSED(PADRright)) {
+        current_state = STATE_SEQ_SELECT;
+        cursor = (cd_saved_cursor < seq_count) ? cd_saved_cursor : 0;
+    }
+}
+
+#endif // ENABLE_CD_BROWSER
+
 // Input Processing
 void processInput(void)
 {
@@ -2103,24 +2502,16 @@ void processInput(void)
     }
     if (current_state == STATE_DEBUG) {
         // Circle to return to previous state
-        if ((pad & PADRright) && !(oldpad & PADRright)) {
+        if (PRESSED(PADRright)) {
             current_state = pre_debug_state;
             oldpad = pad;
             return;
         }
      	// Triangle: interact with audio without leaving the debug screen
         if (vab_mode) {
-            if (pad & PADRup) {
-                if (!(oldpad & PADRup)) {
-                    playNote();
-                }
-            } else {
-                if (oldpad & PADRup) {
-                    stopNote();
-                }
-            }
+            handleTriangleNote();
         } else {
-            if ((pad & PADRup) && !(oldpad & PADRup)) {
+            if (PRESSED(PADRup)) {
                 if (is_playing) {
                     stopSequence();
                 } else {
@@ -2136,15 +2527,15 @@ void processInput(void)
 
     // Global controls that work in all states
     // Select button behavior in playback states
-    if (pad & PADselect && !(oldpad & PADselect)) {
+    if (PRESSED(PADselect)) {
         if (current_state == STATE_PLAYBACK || current_state == STATE_VAB_PLAYBACK) {
-			#if HAS_BACKGROUND_IMAGE
-						// If background image present, Select toggles background
-						bg_state = (bg_state + 1) % 3;  // Cycle 0->1->2->0
-			#else
-						// No background image, Select enters program edit
-						enterProgramEdit();
-			#endif
+#if HAS_BACKGROUND_IMAGE
+            // If background image present, Select toggles background
+            bg_state = (bg_state + 1) % 3;  // Cycle 0->1->2->0
+#else
+            // No background image, Select enters program edit
+            enterProgramEdit();
+#endif
         }
     }
     
@@ -2152,22 +2543,14 @@ void processInput(void)
     // When Select is held, normal inputs are blocked, only Select+button combos work
     int select_layer_active = (pad & PADselect) && (oldpad & PADselect);
     
-    // Triangle - Play/Stop in SEQ mode (wrapped), Play note in VAB mode (always works)
-    if (vab_mode) {
-        // VAB mode - Triangle for note playback ALWAYS works (even with Select held)
-        // This prevents stuck notes when Select is pressed during playback
-        // Actual playback handling is done per-state
-    } else {
-        // SEQ mode - Triangle toggles play/stop (disabled when Select held)
-        if (!select_layer_active) {
-            if (pad & PADRup && !(oldpad & PADRup)) {
-                if (current_state == STATE_PLAYBACK || current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT) {
-                    if (is_playing) {
-                        stopSequence();
-                    } else {
-                        playSequence();
-                    }
-                }
+    // Triangle - Play/Stop in SEQ mode (disabled when Select held)
+    // In VAB mode Triangle note playback is handled per-state
+    if (!vab_mode && !select_layer_active && PRESSED(PADRup)) {
+        if (current_state == STATE_PLAYBACK || current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT) {
+            if (is_playing) {
+                stopSequence();
+            } else {
+                playSequence();
             }
         }
     }
@@ -2176,37 +2559,33 @@ void processInput(void)
     //   SEQ mode  → Pause/Unpause sequence (as before)
     //   VAB mode  → Toggle Serial MIDI on/off
     //   (disabled when Select is held)
-    if (!select_layer_active) {
-        if (pad & PADstart && !(oldpad & PADstart)) {
-            if (!vab_mode &&
-                (current_state == STATE_PLAYBACK      ||
-                 current_state == STATE_PROGRAM_EDIT  ||
-                 current_state == STATE_TONE_EDIT)) {
-                // SEQ mode: pause / unpause
-                pauseSequence();
-            } else if (vab_mode &&
-                       (current_state == STATE_VAB_PLAYBACK  ||
-                        current_state == STATE_PROGRAM_EDIT  ||
-                        current_state == STATE_TONE_EDIT     ||
-                        current_state == STATE_ADSR_EDIT)) {
-                // VAB mode: toggle Serial MIDI (startSerialMidi handles toggle-off)
-                if (serial_midi_enabled) {
-                    stopSerialMidi();
-                } else {
-                    startSerialMidi();
-                }
+    if (!select_layer_active && PRESSED(PADstart)) {
+        if (!vab_mode &&
+            (current_state == STATE_PLAYBACK      ||
+             current_state == STATE_PROGRAM_EDIT  ||
+             current_state == STATE_TONE_EDIT)) {
+            // SEQ mode: pause / unpause
+            pauseSequence();
+        } else if (vab_mode &&
+                   (current_state == STATE_VAB_PLAYBACK  ||
+                    inEditorState())) {
+            // VAB mode: toggle Serial MIDI (startSerialMidi handles toggle-off)
+            if (serial_midi_enabled) {
+                stopSerialMidi();
+            } else {
+                startSerialMidi();
             }
         }
     }
     
     // L2/R2 - Change note in VAB mode (disabled if Select held)
     if (!select_layer_active && vab_mode && (current_state == STATE_VAB_PLAYBACK || current_state == STATE_PROGRAM_EDIT || current_state == STATE_TONE_EDIT)) {
-        if (pad & PADL2 && !(oldpad & PADL2)) {
+        if (PRESSED(PADL2)) {
             current_note--;
             if (current_note < 0) current_note = 0;
             if (note_playing) playNote();  // Restart if playing
         }
-        if (pad & PADR2 && !(oldpad & PADR2)) {
+        if (PRESSED(PADR2)) {
             current_note++;
             if (current_note > 127) current_note = 127;
             if (note_playing) playNote();  // Restart if playing
@@ -2215,73 +2594,50 @@ void processInput(void)
     
     switch (current_state) {
         case STATE_SEQ_SELECT:
-            if (pad & PADLup && !(oldpad & PADLup)) {
-                cursor--;
-                if (cursor < 0) cursor = MAX_SEQ_FILES - 1;
-            }
-            if (pad & PADLdown && !(oldpad & PADLdown)) {
-                cursor++;
-                if (cursor >= MAX_SEQ_FILES) cursor = 0;
-            }
-            if (pad & PADRdown && !(oldpad & PADRdown)) { // X button - SEQ mode
+            navList(seq_count);
+            if (PRESSED(PADRdown)) { // X button - SEQ mode
                 selected_seq = cursor;
                 vab_mode = 0;
                 current_state = STATE_VH_SELECT;
                 cursor = 0;
             }
-            if (pad & PADRleft && !(oldpad & PADRleft)) { // Square button - VAB mode
+            if (PRESSED(PADRleft)) { // Square button - VAB mode
                 vab_mode = 1;
                 current_state = STATE_VAB_VH_SELECT;
                 cursor = 0;
             }
-			#if HAS_BACKGROUND_IMAGE
-						if (pad & PADselect && !(oldpad & PADselect)) { // Select - Toggle background
-							bg_state = (bg_state + 1) % 3;  // Cycle 0->1->2->0
-						}
-			#endif
+#ifdef ENABLE_CD_BROWSER
+            if (PRESSED(PADRup)) { // Triangle button - CD-ROM browser
+                enterCdBrowser();
+            }
+#endif
+#if HAS_BACKGROUND_IMAGE
+            if (PRESSED(PADselect)) { // Select - Toggle background
+                bg_state = (bg_state + 1) % 3;  // Cycle 0->1->2->0
+            }
+#endif
             break;
             
         case STATE_VH_SELECT:
-            if (pad & PADLup && !(oldpad & PADLup)) {
-                cursor--;
-                if (cursor < 0) cursor = MAX_VH_FILES - 1;
-            }
-            if (pad & PADLdown && !(oldpad & PADLdown)) {
-                cursor++;
-                if (cursor >= MAX_VH_FILES) cursor = 0;
-            }
-            if (pad & PADRdown && !(oldpad & PADRdown)) { // X button
+            navList(vh_count);
+            if (PRESSED(PADRdown)) { // X button
                 selected_vh = cursor;
                 
                 // Close previously loaded VAB if any (changing to new file)
-                if (current_audio.vab_id >= 0) {
-                    SsVabClose(current_audio.vab_id);
-                    current_audio.vab_id = -1;
-                }
+                closeVab();
                 
                 // Set up audio file structure
                 current_audio.seq_data = seq_files[selected_seq].data;
                 current_audio.seq_size = seq_files[selected_seq].size;
                 sprintf(current_audio.seq_name, "%s", seq_files[selected_seq].name);
                 
-                current_audio.vh_data = vh_files[selected_vh].data;
-                current_audio.vb_data = vb_files[selected_vh];
-                current_audio.vh_size = vh_files[selected_vh].size;
-                sprintf(current_audio.vh_name, "%s", vh_files[selected_vh].name);
-                
-                // Read VAB header info using VabHdr struct
-                VabHdr* vab_hdr = (VabHdr*)current_audio.vh_data;
-                current_audio.num_programs = vab_hdr->ps;  // Note: 'ps' not 'programs'
-                current_audio.num_tones = vab_hdr->ts;     // Note: 'ts' not 'tones'
+                selectVhFile(selected_vh);
                 
                 current_state = STATE_PLAYBACK;
             }
-            if (pad & PADRright && !(oldpad & PADRright)) { // Circle button
+            if (PRESSED(PADRright)) { // Circle button
                 // Going back to SEQ select - close VAB as user may select different SEQ
-                if (current_audio.vab_id >= 0) {
-                    SsVabClose(current_audio.vab_id);
-                    current_audio.vab_id = -1;
-                }
+                closeVab();
                 current_state = STATE_SEQ_SELECT;
                 cursor = selected_seq;
             }
@@ -2291,201 +2647,69 @@ void processInput(void)
             // If Select is held, skip all normal inputs (layer modifier)
             if (!select_layer_active) {
                 // Circle - Back to VH select
-                if (pad & PADRright && !(oldpad & PADRright)) {
+                if (PRESSED(PADRright)) {
                     stopSequence();
                     current_state = STATE_VH_SELECT;
                     cursor = selected_vh;
                     menu_cursor = 0;
                 }
                 
-                
                 // D-Pad Up/Down - Navigate menu with hold detection
-            if (pad & PADLup) {
-                hold_counter_up++;
-                if (!(oldpad & PADLup)) {
-                    menu_cursor--;
-                    if (menu_cursor < 0) menu_cursor = MENU_ITEM_COUNT - 1;
-                    hold_counter_up = 0;
-                    hold_active_up = 0;
-                } else if (hold_counter_up >= HOLD_THRESHOLD && !hold_active_up) {
-                    hold_active_up = 1;
-                } else if (hold_active_up && (hold_counter_up % HOLD_REPEAT_RATE == 0)) {
-                    menu_cursor--;
-                    if (menu_cursor < 0) menu_cursor = MENU_ITEM_COUNT - 1;
-                }
-            } else {
-                hold_counter_up = 0;
-                hold_active_up = 0;
-            }
-            
-            if (pad & PADLdown) {
-                hold_counter_down++;
-                if (!(oldpad & PADLdown)) {
-                    menu_cursor++;
-                    if (menu_cursor >= MENU_ITEM_COUNT) menu_cursor = 0;
-                    hold_counter_down = 0;
-                    hold_active_down = 0;
-                } else if (hold_counter_down >= HOLD_THRESHOLD && !hold_active_down) {
-                    hold_active_down = 1;
-                } else if (hold_active_down && (hold_counter_down % HOLD_REPEAT_RATE == 0)) {
-                    menu_cursor++;
-                    if (menu_cursor >= MENU_ITEM_COUNT) menu_cursor = 0;
-                }
-            } else {
-                hold_counter_down = 0;
-                hold_active_down = 0;
-            }
-            
-            // X button - Execute menu action
-            if (pad & PADRdown && !(oldpad & PADRdown)) {
-                switch (menu_cursor) {
-                    case MENU_PLAY:
-                        playSequence();
-                        break;
-                    case MENU_PAUSE:
-                        pauseSequence();
-                        break;
-                    case MENU_STOP:
-                        stopSequence();
-                        break;
-                    case MENU_TEMPO:
-                        // If tempo is unchanged, set to default 120
-                        if (!tempo_changed) {
-                            current_tempo = 120;
-                            tempo_changed = 1;
-                            if (is_playing && current_audio.seq_id >= 0) {
-                                SsSeqSetAccelerando(current_audio.seq_id, current_tempo, 120);
+                navMenu(MENU_ITEM_COUNT, -1);
+                
+                // X button - Execute menu action
+                if (PRESSED(PADRdown)) {
+                    switch (menu_cursor) {
+                        case MENU_PLAY:
+                            playSequence();
+                            break;
+                        case MENU_PAUSE:
+                            pauseSequence();
+                            break;
+                        case MENU_STOP:
+                            stopSequence();
+                            break;
+                        case MENU_TEMPO:
+                            // If tempo is unchanged, set to default 120
+                            if (!tempo_changed) {
+                                current_tempo = 120;
+                                tempo_changed = 1;
+                                if (is_playing && current_audio.seq_id >= 0) {
+                                    SsSeqSetAccelerando(current_audio.seq_id, current_tempo, 120);
+                                }
                             }
-                        }
-                        break;
-                    case MENU_PROGRAM_EDIT:
-                        enterProgramEdit();
-                        break;
-                    case MENU_VISUALIZER:
-                        return_state = STATE_PLAYBACK;
-                        current_state = STATE_VISUALIZER;
-                        break;
-                }
-            }
-            
-            // Square - Toggle min/max for current value
-            if (pad & PADRleft && !(oldpad & PADRleft)) {
-                if (menu_cursor >= MENU_TEMPO) {  // Only for value items
-                    toggleMinMax();
-                }
-            }
-            
-            // L1 - Decrease by 10
-            if (pad & PADL1 && !(oldpad & PADL1)) {
-                if (menu_cursor >= MENU_TEMPO) {
-                    adjustMenuValue(-1, 10);
-                }
-            }
-            
-            // R1 - Increase by 10
-            if (pad & PADR1 && !(oldpad & PADR1)) {
-                if (menu_cursor >= MENU_TEMPO) {
-                    adjustMenuValue(1, 10);
-                }
-            }
-            
-            // D-Pad Left/Right with hold detection - Adjust by 1
-            if (menu_cursor >= MENU_TEMPO) {  // Only for value items
-                // Left button
-                if (pad & PADLleft) {
-                    hold_counter_left++;
-                    
-                    // Initial press
-                    if (!(oldpad & PADLleft)) {
-                        adjustMenuValue(-1, 1);
-                        hold_counter_left = 0;
-                        hold_active_left = 0;
+                            break;
+                        case MENU_PROGRAM_EDIT:
+                            enterProgramEdit();
+                            break;
+                        case MENU_VISUALIZER:
+                            return_state = STATE_PLAYBACK;
+                            current_state = STATE_VISUALIZER;
+                            break;
                     }
-                    // Hold threshold reached
-                    else if (hold_counter_left >= HOLD_THRESHOLD && !hold_active_left) {
-                        hold_active_left = 1;
-                    }
-                    // Continuous adjustment while held
-                    else if (hold_active_left && (hold_counter_left % HOLD_REPEAT_RATE == 0)) {
-                        adjustMenuValue(-1, 1);
-                    }
-                } else {
-                    hold_counter_left = 0;
-                    hold_active_left = 0;
                 }
                 
-                // Right button
-                if (pad & PADLright) {
-                    hold_counter_right++;
-                    
-                    // Initial press
-                    if (!(oldpad & PADLright)) {
-                        adjustMenuValue(1, 1);
-                        hold_counter_right = 0;
-                        hold_active_right = 0;
-                    }
-                    // Hold threshold reached
-                    else if (hold_counter_right >= HOLD_THRESHOLD && !hold_active_right) {
-                        hold_active_right = 1;
-                    }
-                    // Continuous adjustment while held
-                    else if (hold_active_right && (hold_counter_right % HOLD_REPEAT_RATE == 0)) {
-                        adjustMenuValue(1, 1);
-                    }
-                } else {
-                    hold_counter_right = 0;
-                    hold_active_right = 0;
+                // Square/L1/R1/D-Pad Left-Right - only for value items
+                if (menu_cursor >= MENU_TEMPO) {
+                    editInput(adjustMenuValue, toggleMinMax);
                 }
-            }
-            // End of normal inputs - closing select_layer_active check
             }
             
             break;
             
         case STATE_VAB_VH_SELECT:
-            if (pad & PADLup && !(oldpad & PADLup)) {
-                cursor--;
-                if (cursor < 0) cursor = MAX_VH_FILES - 1;
-            }
-            if (pad & PADLdown && !(oldpad & PADLdown)) {
-                cursor++;
-                if (cursor >= MAX_VH_FILES) cursor = 0;
-            }
-            if (pad & PADRdown && !(oldpad & PADRdown)) { // X button
+            navList(vh_count);
+            if (PRESSED(PADRdown)) { // X button
                 selected_vh = cursor;
                 
                 // Close previously loaded VAB if any (changing to new file)
-                if (current_audio.vab_id >= 0) {
-                    SsVabClose(current_audio.vab_id);
-                    current_audio.vab_id = -1;
-                }
+                closeVab();
                 
                 // Set up audio file structure for VAB mode
-                current_audio.vh_data = vh_files[selected_vh].data;
-                current_audio.vb_data = vb_files[selected_vh];
-                current_audio.vh_size = vh_files[selected_vh].size;
-                sprintf(current_audio.vh_name, "%s", vh_files[selected_vh].name);
+                selectVhFile(selected_vh);
                 
-                // Read VAB header info
-                VabHdr* vab_hdr = (VabHdr*)current_audio.vh_data;
-                current_audio.num_programs = vab_hdr->ps;
-                current_audio.num_tones = vab_hdr->ts;
-                
-                // Open VAB for VAB mode
-                current_audio.vab_id = SsVabOpenHead(current_audio.vh_data, -1);
-                if (current_audio.vab_id < 0) {
-                    FntPrint("Failed to open VAB header!\n");
-                    break;
-                }
-                
-                // Transfer VAB body
-                if (SsVabTransBody(current_audio.vb_data, current_audio.vab_id) != current_audio.vab_id) {
-                    FntPrint("Failed to transfer VAB body!\n");
-                    SsVabClose(current_audio.vab_id);
-                    current_audio.vab_id = -1;
-                    break;
-                }
-                SsVabTransCompleted(SS_WAIT_COMPLETED);
+                // Open VAB and transfer body to SPU memory
+                if (!openVab()) break;
                 
                 // Enable reverb
                 SsUtSetReverbType(reverb_type);
@@ -2502,14 +2726,11 @@ void processInput(void)
                 
                 current_state = STATE_VAB_PLAYBACK;
             }
-            if (pad & PADRright && !(oldpad & PADRright)) { // Circle button - Back to SEQ select
+            if (PRESSED(PADRright)) { // Circle button - Back to SEQ select
                 // Safety: stop Serial MIDI if somehow still active
                 stopSerialMidi();
                 // Close VAB if any (going back to SEQ select)
-                if (current_audio.vab_id >= 0) {
-                    SsVabClose(current_audio.vab_id);
-                    current_audio.vab_id = -1;
-                }
+                closeVab();
                 current_state = STATE_SEQ_SELECT;
                 cursor = 0;
                 vab_mode = 0;
@@ -2519,143 +2740,35 @@ void processInput(void)
         case STATE_VAB_PLAYBACK:
             // Triangle - Play/sustain note ALWAYS works (even when Select held)
             // This prevents stuck notes
-            if (pad & PADRup) {
-                if (!(oldpad & PADRup)) {
-                    // Triangle pressed
-                    playNote();
-                }
-                // Holding button, note sustains automatically
-            } else {
-                if (oldpad & PADRup) {
-                    // Triangle released
-                    stopNote();
-                }
-            }
+            handleTriangleNote();
             
             // If Select is held, skip all other normal inputs (layer modifier)
             if (!select_layer_active) {
                 // Circle - Back to VH select; also closes Serial MIDI connection
-                if (pad & PADRright && !(oldpad & PADRright)) {
+                if (PRESSED(PADRright)) {
                     stopNote();
                     stopSerialMidi();  // Close serial connection on leaving VAB mode
-                    if (current_audio.vab_id >= 0) {
-                        SsVabClose(current_audio.vab_id);
-                        current_audio.vab_id = -1;
-                    }
+                    closeVab();
                     current_state = STATE_VAB_VH_SELECT;
                     cursor = selected_vh;
                     menu_cursor = 0;
                 }
                 
                 // D-Pad Up/Down - Navigate menu with hold detection
-            if (pad & PADLup) {
-                hold_counter_up++;
-                if (!(oldpad & PADLup)) {
-                    menu_cursor--;
-                    if (menu_cursor < 0) menu_cursor = VAB_MENU_ITEM_COUNT - 1;
-                    hold_counter_up = 0;
-                    hold_active_up = 0;
-                } else if (hold_counter_up >= HOLD_THRESHOLD && !hold_active_up) {
-                    hold_active_up = 1;
-                } else if (hold_active_up && (hold_counter_up % HOLD_REPEAT_RATE == 0)) {
-                    menu_cursor--;
-                    if (menu_cursor < 0) menu_cursor = VAB_MENU_ITEM_COUNT - 1;
-                }
-            } else {
-                hold_counter_up = 0;
-                hold_active_up = 0;
-            }
-            
-            if (pad & PADLdown) {
-                hold_counter_down++;
-                if (!(oldpad & PADLdown)) {
-                    menu_cursor++;
-                    if (menu_cursor >= VAB_MENU_ITEM_COUNT) menu_cursor = 0;
-                    hold_counter_down = 0;
-                    hold_active_down = 0;
-                } else if (hold_counter_down >= HOLD_THRESHOLD && !hold_active_down) {
-                    hold_active_down = 1;
-                } else if (hold_active_down && (hold_counter_down % HOLD_REPEAT_RATE == 0)) {
-                    menu_cursor++;
-                    if (menu_cursor >= VAB_MENU_ITEM_COUNT) menu_cursor = 0;
-                }
-            } else {
-                hold_counter_down = 0;
-                hold_active_down = 0;
-            }
-            
-            // X button - Enter program edit if on PROGRAM_EDIT menu item
-            if (pad & PADRdown && !(oldpad & PADRdown)) {
-                if (menu_cursor == VAB_MENU_PROGRAM_EDIT) {
-                    enterProgramEdit();
-                } else if (menu_cursor == VAB_MENU_VISUALIZER) {
-                    return_state = STATE_VAB_PLAYBACK;
-                    current_state = STATE_VISUALIZER;
-                }
-            }
-            
-            // Square - Toggle min/max for current value
-            if (pad & PADRleft && !(oldpad & PADRleft)) {
-                toggleVabMinMax();
-            }
-            
-            // L1 - Decrease by 10
-            if (pad & PADL1 && !(oldpad & PADL1)) {
-                adjustVabMenuValue(-1, 10);
-            }
-            
-            // R1 - Increase by 10
-            if (pad & PADR1 && !(oldpad & PADR1)) {
-                adjustVabMenuValue(1, 10);
-            }
-            
-            // D-Pad Left/Right with hold detection - Adjust by 1
-            // Left button
-            if (pad & PADLleft) {
-                hold_counter_left++;
+                navMenu(VAB_MENU_ITEM_COUNT, -1);
                 
-                // Initial press
-                if (!(oldpad & PADLleft)) {
-                    adjustVabMenuValue(-1, 1);
-                    hold_counter_left = 0;
-                    hold_active_left = 0;
+                // X button - Enter program edit / visualizer
+                if (PRESSED(PADRdown)) {
+                    if (menu_cursor == VAB_MENU_PROGRAM_EDIT) {
+                        enterProgramEdit();
+                    } else if (menu_cursor == VAB_MENU_VISUALIZER) {
+                        return_state = STATE_VAB_PLAYBACK;
+                        current_state = STATE_VISUALIZER;
+                    }
                 }
-                // Hold threshold reached
-                else if (hold_counter_left >= HOLD_THRESHOLD && !hold_active_left) {
-                    hold_active_left = 1;
-                }
-                // Continuous adjustment while held
-                else if (hold_active_left && (hold_counter_left % HOLD_REPEAT_RATE == 0)) {
-                    adjustVabMenuValue(-1, 1);
-                }
-            } else {
-                hold_counter_left = 0;
-                hold_active_left = 0;
-            }
-            
-            // Right button
-            if (pad & PADLright) {
-                hold_counter_right++;
                 
-                // Initial press
-                if (!(oldpad & PADLright)) {
-                    adjustVabMenuValue(1, 1);
-                    hold_counter_right = 0;
-                    hold_active_right = 0;
-                }
-                // Hold threshold reached
-                else if (hold_counter_right >= HOLD_THRESHOLD && !hold_active_right) {
-                    hold_active_right = 1;
-                }
-                // Continuous adjustment while held
-                else if (hold_active_right && (hold_counter_right % HOLD_REPEAT_RATE == 0)) {
-                    adjustVabMenuValue(1, 1);
-                }
-            } else {
-                hold_counter_right = 0;
-                hold_active_right = 0;
-            }
-            // End of normal inputs, closing select_layer_active check
+                // Square/L1/R1/D-Pad Left-Right
+                editInput(adjustVabMenuValue, toggleVabMinMax);
             }
             
             break;
@@ -2664,205 +2777,59 @@ void processInput(void)
             // If Select is held, skip all normal inputs (layer modifier)
             if (!select_layer_active) {
                 // Circle - Back to playback
-                if (pad & PADRright && !(oldpad & PADRright)) {
+                if (PRESSED(PADRright)) {
                     current_state = return_state;
                     menu_cursor = 0;
                 }
                 
                 // D-Pad Up/Down - Navigate menu with hold detection
-            if (pad & PADLup) {
-                hold_counter_up++;
-                if (!(oldpad & PADLup)) {
-                    menu_cursor--;
-                    if (menu_cursor < 0) menu_cursor = PROG_MENU_ITEM_COUNT - 1;
-                    hold_counter_up = 0;
-                    hold_active_up = 0;
-                } else if (hold_counter_up >= HOLD_THRESHOLD && !hold_active_up) {
-                    hold_active_up = 1;
-                } else if (hold_active_up && (hold_counter_up % HOLD_REPEAT_RATE == 0)) {
-                    menu_cursor--;
-                    if (menu_cursor < 0) menu_cursor = PROG_MENU_ITEM_COUNT - 1;
+                navMenu(PROG_MENU_ITEM_COUNT, -1);
+                
+                // X button - Enter tone edit if on NUM_TONES
+                if (PRESSED(PADRdown)) {
+                    if (menu_cursor == PROG_MENU_NUM_TONES) {
+                        edit_tone = 0;
+                        loadToneData();
+                        current_state = STATE_TONE_EDIT;
+                        menu_cursor = 0;
+                    }
                 }
-            } else {
-                hold_counter_up = 0;
-                hold_active_up = 0;
-            }
-            
-            if (pad & PADLdown) {
-                hold_counter_down++;
-                if (!(oldpad & PADLdown)) {
-                    menu_cursor++;
-                    if (menu_cursor >= PROG_MENU_ITEM_COUNT) menu_cursor = 0;
-                    hold_counter_down = 0;
-                    hold_active_down = 0;
-                } else if (hold_counter_down >= HOLD_THRESHOLD && !hold_active_down) {
-                    hold_active_down = 1;
-                } else if (hold_active_down && (hold_counter_down % HOLD_REPEAT_RATE == 0)) {
-                    menu_cursor++;
-                    if (menu_cursor >= PROG_MENU_ITEM_COUNT) menu_cursor = 0;
-                }
-            } else {
-                hold_counter_down = 0;
-                hold_active_down = 0;
-            }
-            
-            // X button - Enter tone edit if on NUM_TONES
-            if (pad & PADRdown && !(oldpad & PADRdown)) {
-                if (menu_cursor == PROG_MENU_NUM_TONES) {
-                    edit_tone = 0;
-                    loadToneData();
-                    current_state = STATE_TONE_EDIT;
-                    menu_cursor = 0;
-                }
-            }
-            
-            // Square - Toggle min/max
-            if (pad & PADRleft && !(oldpad & PADRleft)) {
-                toggleProgramEditMinMax();
-            }
-            
-            // L1 - Decrease by 10
-            if (pad & PADL1 && !(oldpad & PADL1)) {
-                adjustProgramEditValue(-1, 10);
-            }
-            
-            // R1 - Increase by 10
-            if (pad & PADR1 && !(oldpad & PADR1)) {
-                adjustProgramEditValue(1, 10);
-            }
-            
-            // D-Pad Left/Right with hold detection
-            if (pad & PADLleft) {
-                hold_counter_left++;
-                if (!(oldpad & PADLleft)) {
-                    adjustProgramEditValue(-1, 1);
-                    hold_counter_left = 0;
-                    hold_active_left = 0;
-                } else if (hold_counter_left >= HOLD_THRESHOLD && !hold_active_left) {
-                    hold_active_left = 1;
-                } else if (hold_active_left && (hold_counter_left % HOLD_REPEAT_RATE == 0)) {
-                    adjustProgramEditValue(-1, 1);
-                }
-            } else {
-                hold_counter_left = 0;
-                hold_active_left = 0;
-            }
-            
-            if (pad & PADLright) {
-                hold_counter_right++;
-                if (!(oldpad & PADLright)) {
-                    adjustProgramEditValue(1, 1);
-                    hold_counter_right = 0;
-                    hold_active_right = 0;
-                } else if (hold_counter_right >= HOLD_THRESHOLD && !hold_active_right) {
-                    hold_active_right = 1;
-                } else if (hold_active_right && (hold_counter_right % HOLD_REPEAT_RATE == 0)) {
-                    adjustProgramEditValue(1, 1);
-                }
-            } else {
-                hold_counter_right = 0;
-                hold_active_right = 0;
-            }
-            // End of normal inputs, closing select_layer_active check
+                
+                // Square/L1/R1/D-Pad Left-Right
+                editInput(adjustProgramEditValue, toggleProgramEditMinMax);
             }
             
             // Triangle - Play note in VAB mode ALWAYS works (even when Select held)
             if (vab_mode) {
-                if (pad & PADRup) {
-                    if (!(oldpad & PADRup)) {
-                        playNote();
-                    }
-                } else {
-                    if (oldpad & PADRup) {
-                        stopNote();
-                    }
-                }
+                handleTriangleNote();
             }
             
             break;
             
         case STATE_TONE_EDIT:
-            // NORMAL NAVIGATION MODE
-            
             // Select+L1/R1 combos work when Select is held (NOT wrapped)
-                if (pad & PADselect) {
-                    if (pad & PADL1 && !(oldpad & PADL1)) {
-                        // Previous program
-                        saveToneData();
-                        edit_program--;
-                        if (edit_program < 0) edit_program = 0;
-                        loadProgramData();
-                        edit_tone = 0;
-                        loadToneData();
-                    }
-                    if (pad & PADR1 && !(oldpad & PADR1)) {
-                        // Next program
-                        saveToneData();
-                        edit_program++;
-                        if (edit_program >= current_audio.num_programs) {
-                            edit_program = current_audio.num_programs - 1;
-                        }
-                        loadProgramData();
-                        edit_tone = 0;
-                        loadToneData();
-                    }
+            if (pad & PADselect) {
+                if (PRESSED(PADL1)) {
+                    toneEditProgramStep(-1);  // Previous program
                 }
-                
-                // All other normal inputs (wrapped, disabled when Select held)
-                if (!select_layer_active) {
-                    // Circle - Back to program edit
-                if (pad & PADRright && !(oldpad & PADRright)) {
+                if (PRESSED(PADR1)) {
+                    toneEditProgramStep(1);   // Next program
+                }
+            }
+            
+            // All other normal inputs (wrapped, disabled when Select is held)
+            if (!select_layer_active) {
+                // Circle - Back to program edit
+                if (PRESSED(PADRright)) {
                     current_state = STATE_PROGRAM_EDIT;
                     menu_cursor = PROG_MENU_NUM_TONES;
                 }
                 
                 // D-Pad Up/Down - Navigate menu with hold detection (skip NOTE_SEL if not VAB mode)
-                if (pad & PADLup) {
-                    hold_counter_up++;
-                    if (!(oldpad & PADLup)) {
-                        do {
-                            menu_cursor--;
-                            if (menu_cursor < 0) menu_cursor = TONE_MENU_ITEM_COUNT - 1;
-                        } while (menu_cursor == TONE_MENU_NOTE_SEL && !vab_mode);
-                        hold_counter_up = 0;
-                        hold_active_up = 0;
-                    } else if (hold_counter_up >= HOLD_THRESHOLD && !hold_active_up) {
-                        hold_active_up = 1;
-                    } else if (hold_active_up && (hold_counter_up % HOLD_REPEAT_RATE == 0)) {
-                        do {
-                            menu_cursor--;
-                            if (menu_cursor < 0) menu_cursor = TONE_MENU_ITEM_COUNT - 1;
-                        } while (menu_cursor == TONE_MENU_NOTE_SEL && !vab_mode);
-                    }
-                } else {
-                    hold_counter_up = 0;
-                    hold_active_up = 0;
-                }
-                
-                if (pad & PADLdown) {
-                    hold_counter_down++;
-                    if (!(oldpad & PADLdown)) {
-                        do {
-                            menu_cursor++;
-                            if (menu_cursor >= TONE_MENU_ITEM_COUNT) menu_cursor = 0;
-                        } while (menu_cursor == TONE_MENU_NOTE_SEL && !vab_mode);
-                        hold_counter_down = 0;
-                        hold_active_down = 0;
-                    } else if (hold_counter_down >= HOLD_THRESHOLD && !hold_active_down) {
-                        hold_active_down = 1;
-                    } else if (hold_active_down && (hold_counter_down % HOLD_REPEAT_RATE == 0)) {
-                        do {
-                            menu_cursor++;
-                            if (menu_cursor >= TONE_MENU_ITEM_COUNT) menu_cursor = 0;
-                        } while (menu_cursor == TONE_MENU_NOTE_SEL && !vab_mode);
-                    }
-                } else {
-                    hold_counter_down = 0;
-                    hold_active_down = 0;
-                }
+                navMenu(TONE_MENU_ITEM_COUNT, vab_mode ? -1 : TONE_MENU_NOTE_SEL);
                 
                 // X button - Enter ADSR parameter editor if on ADSR1 or ADSR2
-                if (pad & PADRdown && !(oldpad & PADRdown)) {
+                if (PRESSED(PADRdown)) {
                     if (menu_cursor == TONE_MENU_ADSR1) {
                         enterAdsrEdit(1);  // Edit ADSR1
                     } else if (menu_cursor == TONE_MENU_ADSR2) {
@@ -2870,74 +2837,16 @@ void processInput(void)
                     }
                 }
                 
-                // Square - Toggle min/max
-                if (pad & PADRleft && !(oldpad & PADRleft)) {
-                    toggleToneEditMinMax();
-                }
-                
-                // L1 - Decrease by 10 (skip for ADSR)
-                if (pad & PADL1 && !(oldpad & PADL1)) {
-                    if (menu_cursor != TONE_MENU_ADSR1 && menu_cursor != TONE_MENU_ADSR2) {
-                        adjustToneEditValue(-1, 10);
-                    }
-                }
-                
-                // R1 - Increase by 10 (skip for ADSR)
-                if (pad & PADR1 && !(oldpad & PADR1)) {
-                    if (menu_cursor != TONE_MENU_ADSR1 && menu_cursor != TONE_MENU_ADSR2) {
-                        adjustToneEditValue(1, 10);
-                    }
-                }
-                
-                // D-Pad Left/Right with hold detection (skip for ADSR)
+                // Square/L1/R1/D-Pad Left-Right (ADSR rows are edited with X instead)
                 if (menu_cursor != TONE_MENU_ADSR1 && menu_cursor != TONE_MENU_ADSR2) {
-                    if (pad & PADLleft) {
-                        hold_counter_left++;
-                        if (!(oldpad & PADLleft)) {
-                            adjustToneEditValue(-1, 1);
-                            hold_counter_left = 0;
-                            hold_active_left = 0;
-                        } else if (hold_counter_left >= HOLD_THRESHOLD && !hold_active_left) {
-                            hold_active_left = 1;
-                        } else if (hold_active_left && (hold_counter_left % HOLD_REPEAT_RATE == 0)) {
-                            adjustToneEditValue(-1, 1);
-                        }
-                    } else {
-                        hold_counter_left = 0;
-                        hold_active_left = 0;
-                    }
-                    
-                    if (pad & PADLright) {
-                        hold_counter_right++;
-                        if (!(oldpad & PADLright)) {
-                            adjustToneEditValue(1, 1);
-                            hold_counter_right = 0;
-                            hold_active_right = 0;
-                        } else if (hold_counter_right >= HOLD_THRESHOLD && !hold_active_right) {
-                            hold_active_right = 1;
-                        } else if (hold_active_right && (hold_counter_right % HOLD_REPEAT_RATE == 0)) {
-                            adjustToneEditValue(1, 1);
-                        }
-                    } else {
-                        hold_counter_right = 0;
-                        hold_active_right = 0;
-                    }
+                    editInput(adjustToneEditValue, toggleToneEditMinMax);
                 }
-                // End of normal inputs, closing select_layer_active check
-                }
-                
-                // Triangle - Play note in VAB mode ALWAYS works (even when Select held)
-                if (vab_mode) {
-                    if (pad & PADRup) {
-                        if (!(oldpad & PADRup)) {
-                            playNote();
-                        }
-                    } else {
-                        if (oldpad & PADRup) {
-                            stopNote();
-                        }
-                    }
-                }
+            }
+            
+            // Triangle - Play note in VAB mode ALWAYS works (not disabled by select held)
+            if (vab_mode) {
+                handleTriangleNote();
+            }
             
             break;
             
@@ -2945,49 +2854,15 @@ void processInput(void)
             // If Select is held, skip all normal inputs (layer modifier)
             if (!select_layer_active) {
                 // Circle - Cancel and exit
-                if (pad & PADRright && !(oldpad & PADRright)) {
+                if (PRESSED(PADRright)) {
                     exitAdsrEdit(0);  // Don't save
                 }
                 
                 // D-Pad Up/Down - Navigate menu with hold detection
-                if (pad & PADLup) {
-                    hold_counter_up++;
-                    if (!(oldpad & PADLup)) {
-                        menu_cursor--;
-                        if (menu_cursor < 0) menu_cursor = ADSR_MENU_ITEM_COUNT - 1;
-                        hold_counter_up = 0;
-                        hold_active_up = 0;
-                    } else if (hold_counter_up >= HOLD_THRESHOLD && !hold_active_up) {
-                        hold_active_up = 1;
-                    } else if (hold_active_up && (hold_counter_up % HOLD_REPEAT_RATE == 0)) {
-                        menu_cursor--;
-                        if (menu_cursor < 0) menu_cursor = ADSR_MENU_ITEM_COUNT - 1;
-                    }
-                } else {
-                    hold_counter_up = 0;
-                    hold_active_up = 0;
-                }
-                
-                if (pad & PADLdown) {
-                    hold_counter_down++;
-                    if (!(oldpad & PADLdown)) {
-                        menu_cursor++;
-                        if (menu_cursor >= ADSR_MENU_ITEM_COUNT) menu_cursor = 0;
-                        hold_counter_down = 0;
-                        hold_active_down = 0;
-                    } else if (hold_counter_down >= HOLD_THRESHOLD && !hold_active_down) {
-                        hold_active_down = 1;
-                    } else if (hold_active_down && (hold_counter_down % HOLD_REPEAT_RATE == 0)) {
-                        menu_cursor++;
-                        if (menu_cursor >= ADSR_MENU_ITEM_COUNT) menu_cursor = 0;
-                    }
-                } else {
-                    hold_counter_down = 0;
-                    hold_active_down = 0;
-                }
+                navMenu(ADSR_MENU_ITEM_COUNT, -1);
                 
                 // X button - Execute action (Save or Cancel)
-                if (pad & PADRdown && !(oldpad & PADRdown)) {
+                if (PRESSED(PADRdown)) {
                     if (menu_cursor == ADSR_MENU_SAVE) {
                         exitAdsrEdit(1);  // Save
                     } else if (menu_cursor == ADSR_MENU_CANCEL) {
@@ -2995,92 +2870,31 @@ void processInput(void)
                     }
                 }
                 
-                // Square - Toggle min/max or boolean values
-                if (pad & PADRleft && !(oldpad & PADRleft)) {
-                    if (menu_cursor < ADSR_MENU_SAVE) {
-                        toggleAdsrValue();
-                    }
-                }
-                
-                // L1 - Decrease by 10
-                if (pad & PADL1 && !(oldpad & PADL1)) {
-                    if (menu_cursor < ADSR_MENU_SAVE) {
-                        adjustAdsrValue(-1, 10);
-                    }
-                }
-                
-                // R1 - Increase by 10
-                if (pad & PADR1 && !(oldpad & PADR1)) {
-                    if (menu_cursor < ADSR_MENU_SAVE) {
-                        adjustAdsrValue(1, 10);
-                    }
-                }
-                
-                // D-Pad Left/Right with hold detection
-                if (pad & PADLleft) {
-                    hold_counter_left++;
-                    if (!(oldpad & PADLleft)) {
-                        adjustAdsrValue(-1, 1);
-                        hold_counter_left = 0;
-                        hold_active_left = 0;
-                    } else if (hold_counter_left >= HOLD_THRESHOLD && !hold_active_left) {
-                        hold_active_left = 1;
-                    } else if (hold_active_left && (hold_counter_left % HOLD_REPEAT_RATE == 0)) {
-                        adjustAdsrValue(-1, 1);
-                    }
-                } else {
-                    hold_counter_left = 0;
-                    hold_active_left = 0;
-                }
-                
-                if (pad & PADLright) {
-                    hold_counter_right++;
-                    if (!(oldpad & PADLright)) {
-                        adjustAdsrValue(1, 1);
-                        hold_counter_right = 0;
-                        hold_active_right = 0;
-                    } else if (hold_counter_right >= HOLD_THRESHOLD && !hold_active_right) {
-                        hold_active_right = 1;
-                    } else if (hold_active_right && (hold_counter_right % HOLD_REPEAT_RATE == 0)) {
-                        adjustAdsrValue(1, 1);
-                    }
-                } else {
-                    hold_counter_right = 0;
-                    hold_active_right = 0;
-                }
+                // Square/L1/R1/D-Pad Left-Right (no-ops on SAVE/CANCEL)
+                editInput(adjustAdsrValue, toggleAdsrValue);
             }
             
             // Triangle - Play note in VAB mode ALWAYS works
             if (vab_mode) {
-                if (pad & PADRup) {
-                    if (!(oldpad & PADRup)) {
-                        playNote();
-                    }
-                } else {
-                    if (oldpad & PADRup) {
-                        stopNote();
-                    }
-                }
+                handleTriangleNote();
             }
             
             break;
             
+#ifdef ENABLE_CD_BROWSER
+        case STATE_CD_BROWSER:
+            cdBrowserInput();
+            break;
+#endif
+
         case STATE_VISUALIZER:
             // Circle: return to previous state
-            if (pad & PADRright && !(oldpad & PADRright)) {
+            if (PRESSED(PADRright)) {
                 current_state = return_state;
             }
             // Triangle in VAB mode still works for note preview
             if (vab_mode) {
-                if (pad & PADRup) {
-                    if (!(oldpad & PADRup)) {
-                        playNote();
-                    }
-                } else {
-                    if (oldpad & PADRup) {
-                        stopNote();
-                    }
-                }
+                handleTriangleNote();
             }
             break;
     }
@@ -3088,23 +2902,77 @@ void processInput(void)
     oldpad = pad;
 }
 
+// Rows of a file list
+static void listWindow(int count, int cur, int rows, int* top, int* end)
+{
+    int t = cur - rows / 2;
+    if (t > count - rows) t = count - rows;
+    if (t < 0) t = 0;
+    *top = t;
+    *end = (t + rows < count) ? t + rows : count;
+}
+
+// File list used by the SEQ and VH select screens (uses 'cursor')
+// Lists with more than LIST_ROWS files scroll, "..." marks hidden entries
+static void drawFileList(const FileEntry* files, int count)
+{
+    int i, top, end;
+
+    listWindow(count, cursor, LIST_ROWS, &top, &end);
+    if (top > 0) FntPrint("  ...\n");
+    for (i = top; i < end; i++) {
+        FntPrint("%c %s\n", (i == cursor) ? '>' : ' ', files[i].name);
+    }
+    if (end < count) FntPrint("  ...\n");
+}
+
+#ifdef ENABLE_CD_BROWSER
+void drawCdBrowser(void)
+{
+    const CdFolder* f = &cd_folder[cd_folder_sel];
+    int i, top, end;
+
+    FntPrint("\n");
+    FntPrint("=== CD-ROM BROWSER ===\n\n");
+    FntPrint("%s  %s\n\n", cd_folder_sel == 0 ? "[SEQ]" : " SEQ ",
+                           cd_folder_sel == 1 ? "[VAB]" : " VAB ");
+
+    FntPrint("-------------------\n");
+    if (f->count == 0) {
+        FntPrint("  (NO FILES)\n");
+    } else {
+        listWindow(f->count, cd_cursor, CD_LIST_ROWS, &top, &end);
+        if (top > 0) FntPrint("  ...\n");
+        for (i = top; i < end; i++) {
+            FntPrint("%c %s %dK%s\n", (i == cd_cursor) ? '>' : ' ',
+                     f->entry[i].name, (int)((f->entry[i].size + 1023) / 1024),
+                     cdEntryLoaded(cd_folder_sel, &f->entry[i]) ? " [LOADED]" : "");
+        }
+        if (end < f->count) FntPrint("  ...\n");
+    }
+    FntPrint("-------------------\n");
+    FntPrint("%s\n", cd_status);
+    FntPrint("RAM: %d/%dK\n", (int)(cd_pool_used / 1024), (int)(CD_POOL_SIZE / 1024));
+
+    FntPrint("\n");
+    FntPrint("(?)CONTROLS\n");
+    FntPrint("X: LOAD FILE\n");
+    FntPrint("L1/R1: SEQ/VAB FOLDER\n");
+    FntPrint("SQUARE: UNLOAD ALL\n");
+    FntPrint("START: RESCAN DISC\n");
+    FntPrint("CIRCLE: BACK\n");
+}
+#endif // ENABLE_CD_BROWSER
+
 //Initial screen, program boots to SEQ file selection
 void drawSeqSelect(void)
 {
-    int i;
-    
 	FntPrint("\n");
     FntPrint("=== SEQ PLAYER ===\n\n");
     FntPrint("AVAILABLE SEQ FILES:\n\n");
     
 	FntPrint("-------------------\n");
-    for (i = 0; i < MAX_SEQ_FILES; i++) {
-        if (i == cursor) {
-            FntPrint("> %s\n", seq_files[i].name);
-        } else {
-            FntPrint("  %s\n", seq_files[i].name);
-        }
-    }
+    drawFileList(seq_files, seq_count);
     FntPrint("-------------------\n");
 
     FntPrint("\n");
@@ -3112,31 +2980,36 @@ void drawSeqSelect(void)
     FntPrint("X: OPEN FILE IN SEQ MODE\n");
     FntPrint("SQUARE: SOUNDBANK MODE\n");
 	FntPrint("[SKIPS SEQ FILE SELECTION]");
+#ifdef ENABLE_CD_BROWSER
+    FntPrint("\nTRIANGLE: CD-ROM BROWSER");
+#endif
 }
 
 void drawVhSelect(void)
 {
-    int i;
-    
 	FntPrint("\n");
     FntPrint("=== SEQ PLAYER ===\n\n");
     FntPrint("SELECTED SEQ: %s\n\n", seq_files[selected_seq].name);
 	FntPrint("AVAILABLE VH FILES:\n\n");
 
     FntPrint("-------------------\n");
-    for (i = 0; i < MAX_VH_FILES; i++) {
-        if (i == cursor) {
-            FntPrint("> %s\n", vh_files[i].name);
-        } else {
-            FntPrint("  %s\n", vh_files[i].name);
-        }
-    }
+    drawFileList(vh_files, vh_count);
     FntPrint("-------------------\n");
 
     FntPrint("\n");
 	FntPrint("(?)CONTROLS\n");
     FntPrint("X: SELECT VH FILE\n");
     FntPrint("CIRCLE: BACK TO MODE SELECT\n");
+}
+
+// The four reverb rows shared by both playback screens
+// first_item is the menu index of the REV TYPE row (rows follow in ReverbParam order)
+static void drawReverbRows(int first_item)
+{
+    FntPrint("%c REV TYPE: %s\n",     CUR(first_item),     getReverbTypeName(reverb_type));
+    FntPrint("%c REV DEPTH: %d\n",    CUR(first_item + 1), reverb_depth_left);
+    FntPrint("%c REV DELAY: %d\n",    CUR(first_item + 2), reverb_delay);
+    FntPrint("%c REV FEEDBACK: %d\n", CUR(first_item + 3), reverb_feedback);
 }
 
 void drawPlayback(void)
@@ -3162,83 +3035,20 @@ void drawPlayback(void)
     // Menu items
     FntPrint("-------------------\n");
     
-    // PLAY
-    if (menu_cursor == MENU_PLAY) {
-        FntPrint("> PLAY\n");
-    } else {
-        FntPrint("  PLAY\n");
-    }
-    
-    // PAUSE
-    if (menu_cursor == MENU_PAUSE) {
-        FntPrint("> PAUSE\n");
-    } else {
-        FntPrint("  PAUSE\n");
-    }
-    
-    // STOP
-    if (menu_cursor == MENU_STOP) {
-        FntPrint("> STOP\n");
-    } else {
-        FntPrint("  STOP\n");
-    }
+    FntPrint("%c PLAY\n",  CUR(MENU_PLAY));
+    FntPrint("%c PAUSE\n", CUR(MENU_PAUSE));
+    FntPrint("%c STOP\n",  CUR(MENU_STOP));
     
     // TEMPO
-    if (menu_cursor == MENU_TEMPO) {
-        if (tempo_changed) {
-            FntPrint("> TEMPO: %d\n", current_tempo);
-        } else {
-            FntPrint("> TEMPO: UNCHANGED (X)\n");
-        }
+    if (tempo_changed) {
+        FntPrint("%c TEMPO: %d\n", CUR(MENU_TEMPO), current_tempo);
     } else {
-        if (tempo_changed) {
-            FntPrint("  TEMPO: %d\n", current_tempo);
-        } else {
-            FntPrint("  TEMPO: UNCHANGED\n");
-        }
+        FntPrint("%c TEMPO: UNCHANGED%s\n", CUR(MENU_TEMPO), SEL(MENU_TEMPO, " (X)"));
     }
     
-    // REVERB TYPE
-    if (menu_cursor == MENU_REV_TYPE) {
-        FntPrint("> REV TYPE: %s\n", getReverbTypeName(reverb_type));
-    } else {
-        FntPrint("  REV TYPE: %s\n", getReverbTypeName(reverb_type));
-    }
-    
-    // REVERB DEPTH
-    if (menu_cursor == MENU_REV_DEPTH) {
-        FntPrint("> REV DEPTH: %d\n", reverb_depth_left);
-    } else {
-        FntPrint("  REV DEPTH: %d\n", reverb_depth_left);
-    }
-    
-    // REVERB DELAY
-    if (menu_cursor == MENU_REV_DELAY) {
-        FntPrint("> REV DELAY: %d\n", reverb_delay);
-    } else {
-        FntPrint("  REV DELAY: %d\n", reverb_delay);
-    }
-    
-    // REVERB FEEDBACK
-    if (menu_cursor == MENU_REV_FEEDBACK) {
-        FntPrint("> REV FEEDBACK: %d\n", reverb_feedback);
-    } else {
-        FntPrint("  REV FEEDBACK: %d\n", reverb_feedback);
-    }
-    
-    // PROGRAM EDIT
-    if (menu_cursor == MENU_PROGRAM_EDIT) {
-        FntPrint("> PROGRAM EDIT\n");
-    } else {
-        FntPrint("  PROGRAM EDIT\n");
-    }
-    
-    // VISUALIZER
-    if (menu_cursor == MENU_VISUALIZER) {
-        FntPrint("> VISUALIZER\n");
-    } else {
-        FntPrint("  VISUALIZER\n");
-    }
+    drawReverbRows(MENU_REV_TYPE);
+    FntPrint("%c PROGRAM EDIT\n",    CUR(MENU_PROGRAM_EDIT));
+    FntPrint("%c VISUALIZER\n",      CUR(MENU_VISUALIZER));
 	FntPrint("-------------------\n");
     
 	FntPrint("\n");
@@ -3253,20 +3063,12 @@ void drawPlayback(void)
 
 void drawVabVhSelect(void)
 {
-    int i;
-    
     FntPrint("\n");
     FntPrint("=== VAB PLAYER ===\n\n");
     FntPrint("AVAILABLE VH FILES:\n\n");
     
 	FntPrint("-------------------\n");
-    for (i = 0; i < MAX_VH_FILES; i++) {
-        if (i == cursor) {
-            FntPrint("> %s\n", vh_files[i].name);
-        } else {
-            FntPrint("  %s\n", vh_files[i].name);
-        }
-    }
+    drawFileList(vh_files, vh_count);
     FntPrint("-------------------\n");
 
     FntPrint("\n");
@@ -3314,61 +3116,11 @@ void drawVabPlayback(void)
     // Menu items
     FntPrint("-------------------\n");
     
-    // NOTE
-    if (menu_cursor == VAB_MENU_NOTE) {
-        FntPrint("> NOTE: %d (%s%d)\n", current_note, note_name, octave);
-    } else {
-        FntPrint("  NOTE: %d (%s%d)\n", current_note, note_name, octave);
-    }
-    
-    // PROGRAM
-    if (menu_cursor == VAB_MENU_PROGRAM) {
-        FntPrint("> PROGRAM: %d\n", current_program);
-    } else {
-        FntPrint("  PROGRAM: %d\n", current_program);
-    }
-    
-    // REVERB TYPE
-    if (menu_cursor == VAB_MENU_REV_TYPE) {
-        FntPrint("> REV TYPE: %s\n", getReverbTypeName(reverb_type));
-    } else {
-        FntPrint("  REV TYPE: %s\n", getReverbTypeName(reverb_type));
-    }
-    
-    // REVERB DEPTH
-    if (menu_cursor == VAB_MENU_REV_DEPTH) {
-        FntPrint("> REV DEPTH: %d\n", reverb_depth_left);
-    } else {
-        FntPrint("  REV DEPTH: %d\n", reverb_depth_left);
-    }
-    
-    // REVERB DELAY
-    if (menu_cursor == VAB_MENU_REV_DELAY) {
-        FntPrint("> REV DELAY: %d\n", reverb_delay);
-    } else {
-        FntPrint("  REV DELAY: %d\n", reverb_delay);
-    }
-    
-    // REVERB FEEDBACK
-    if (menu_cursor == VAB_MENU_REV_FEEDBACK) {
-        FntPrint("> REV FEEDBACK: %d\n", reverb_feedback);
-    } else {
-        FntPrint("  REV FEEDBACK: %d\n", reverb_feedback);
-    }
-    
-    // PROGRAM EDIT
-    if (menu_cursor == VAB_MENU_PROGRAM_EDIT) {
-        FntPrint("> PROGRAM EDIT\n");
-    } else {
-        FntPrint("  PROGRAM EDIT\n");
-    }
-    
-    // VISUALIZER
-    if (menu_cursor == VAB_MENU_VISUALIZER) {
-        FntPrint("> VISUALIZER\n");
-    } else {
-        FntPrint("  VISUALIZER\n");
-    }
+    FntPrint("%c NOTE: %d (%s%d)\n",   CUR(VAB_MENU_NOTE), current_note, note_name, octave);
+    FntPrint("%c PROGRAM: %d\n",        CUR(VAB_MENU_PROGRAM),      current_program);
+    drawReverbRows(VAB_MENU_REV_TYPE);
+    FntPrint("%c PROGRAM EDIT\n",       CUR(VAB_MENU_PROGRAM_EDIT));
+    FntPrint("%c VISUALIZER\n",         CUR(VAB_MENU_VISUALIZER));
     FntPrint("-------------------\n");
 
 	FntPrint("\n");
@@ -3414,55 +3166,20 @@ void drawProgramEdit(void)
 	// Menu items
     FntPrint("-------------------\n");
     
-    // PROGRAM SELECTOR
-    if (menu_cursor == PROG_MENU_PROGRAM_SEL) {
-        FntPrint("> PROGRAM: %d\n", edit_program);
-    } else {
-        FntPrint("  PROGRAM: %d\n", edit_program);
-    }
+    FntPrint("%c PROGRAM: %d\n", CUR(PROG_MENU_PROGRAM_SEL), edit_program);
     
     // NUM TONES (press X to edit)
-    if (menu_cursor == PROG_MENU_NUM_TONES) {
-        FntPrint("> TONES: %d (X:EDIT)\n", current_prog_atr.tones);
-    } else {
-        FntPrint("  TONES: %d\n", current_prog_atr.tones);
-    }
+    FntPrint("%c TONES: %d%s\n", CUR(PROG_MENU_NUM_TONES), current_prog_atr.tones,
+             SEL(PROG_MENU_NUM_TONES, " (X:EDIT)"));
     
-    // PROGRAM VOLUME
-    if (menu_cursor == PROG_MENU_PROG_VOL) {
-        FntPrint("> PROG VOL: %d%s\n", current_prog_atr.mvol, 
-                 isProgramValueChanged(PROG_MENU_PROG_VOL) ? " !" : "");
-    } else {
-        FntPrint("  PROG VOL: %d%s\n", current_prog_atr.mvol,
-                 isProgramValueChanged(PROG_MENU_PROG_VOL) ? " !" : "");
-    }
-    
-    // PROGRAM PAN
-    if (menu_cursor == PROG_MENU_PROG_PAN) {
-        FntPrint("> PROG PAN: %d%s\n", current_prog_atr.mpan,
-                 isProgramValueChanged(PROG_MENU_PROG_PAN) ? " !" : "");
-    } else {
-        FntPrint("  PROG PAN: %d%s\n", current_prog_atr.mpan,
-                 isProgramValueChanged(PROG_MENU_PROG_PAN) ? " !" : "");
-    }
-    
-    // MASTER VOLUME
-    if (menu_cursor == PROG_MENU_MASTER_VOL) {
-        FntPrint("> MASTER VOL: %d%s\n", vab_master_vol,
-                 isProgramValueChanged(PROG_MENU_MASTER_VOL) ? " !" : "");
-    } else {
-        FntPrint("  MASTER VOL: %d%s\n", vab_master_vol,
-                 isProgramValueChanged(PROG_MENU_MASTER_VOL) ? " !" : "");
-    }
-    
-    // MASTER PAN
-    if (menu_cursor == PROG_MENU_MASTER_PAN) {
-        FntPrint("> MASTER PAN: %d%s\n", vab_master_pan,
-                 isProgramValueChanged(PROG_MENU_MASTER_PAN) ? " !" : "");
-    } else {
-        FntPrint("  MASTER PAN: %d%s\n", vab_master_pan,
-                 isProgramValueChanged(PROG_MENU_MASTER_PAN) ? " !" : "");
-    }
+    FntPrint("%c PROG VOL: %d%s\n", CUR(PROG_MENU_PROG_VOL), current_prog_atr.mvol,
+             CHG(isProgramValueChanged, PROG_MENU_PROG_VOL));
+    FntPrint("%c PROG PAN: %d%s\n", CUR(PROG_MENU_PROG_PAN), current_prog_atr.mpan,
+             CHG(isProgramValueChanged, PROG_MENU_PROG_PAN));
+    FntPrint("%c MASTER VOL: %d%s\n", CUR(PROG_MENU_MASTER_VOL), vab_master_vol,
+             CHG(isProgramValueChanged, PROG_MENU_MASTER_VOL));
+    FntPrint("%c MASTER PAN: %d%s\n", CUR(PROG_MENU_MASTER_PAN), vab_master_pan,
+             CHG(isProgramValueChanged, PROG_MENU_MASTER_PAN));
     FntPrint("-------------------\n");
 
     FntPrint("\n");
@@ -3481,9 +3198,10 @@ void drawProgramEdit(void)
 void drawToneEdit(void)
 {
     const char* note_names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-    int octave, center_octave;
+    int i, item;
+    int octave;
+    u_char val;
     const char* note_name;
-    const char* center_note_name;
     
     FntPrint("\n");
     FntPrint("=== TONE EDITOR ===  ");
@@ -3508,139 +3226,48 @@ void drawToneEdit(void)
     
     FntPrint("-------------------\n");
     
-    // Menu items
-    if (menu_cursor == TONE_MENU_PROG) {
-        FntPrint("> PROGRAM: %d\n", edit_program);
-    } else {
-        FntPrint("  PROGRAM: %d\n", edit_program);
-    }
+    // PROGRAM
+    FntPrint("%c PROGRAM: %d\n", CUR(TONE_MENU_PROG), edit_program);
     
-    // TONE SELECTOR
+    // TONE SELECTOR (VAG number only shown while the row is selected)
+    FntPrint("%c TONE: %d/%d", CUR(TONE_MENU_TONE_SEL), edit_tone, current_prog_atr.tones - 1);
     if (menu_cursor == TONE_MENU_TONE_SEL) {
-        FntPrint("> TONE: %d/%d", edit_tone, current_prog_atr.tones - 1);
-		FntPrint(" VAG: %d\n", current_vag_atr.vag);
-    } else {
-        FntPrint("  TONE: %d/%d\n", edit_tone, current_prog_atr.tones - 1);
+        FntPrint(" VAG: %d", current_vag_atr.vag);
     }
+    FntPrint("\n");
     
     // NOTE SELECTOR (VAB mode only)
     if (vab_mode) {
         octave = (current_note / 12) - 1;
         note_name = note_names[current_note % 12];
-        if (menu_cursor == TONE_MENU_NOTE_SEL) {
-            FntPrint("> NOTE: %d (%s%d)\n", current_note, note_name, octave);
+        FntPrint("%c NOTE: %d (%s%d)\n", CUR(TONE_MENU_NOTE_SEL), current_note, note_name, octave);
+    }
+    
+    // PRIORITY, MODE, VOL, PAN, CENTER, SHIFT, MIN, MAX, PBMIN, PBMAX
+    for (i = 0; i < TONE_FIELD_COUNT; i++) {
+        item = TONE_MENU_PRIOR + i;
+        val  = *((u_char*)&current_vag_atr + tone_fields[i].off);
+
+        if (item == TONE_MENU_MODE) {
+            FntPrint("%c %s: %s%s\n", CUR(item), tone_fields[i].label,
+                     val == 0 ? "NORMAL" : "REVERB",
+                     CHG(isToneValueChanged, item));
+        } else if (item == TONE_MENU_CENTER) {
+            // Center note also shows its note name
+            FntPrint("%c %s: %d(%s%d)%s\n", CUR(item), tone_fields[i].label,
+                     val, note_names[val % 12], (val / 12) - 1,
+                     CHG(isToneValueChanged, item));
         } else {
-            FntPrint("  NOTE: %d (%s%d)\n", current_note, note_name, octave);
+            FntPrint("%c %s: %d%s\n", CUR(item), tone_fields[i].label, val,
+                     CHG(isToneValueChanged, item));
         }
     }
     
-    // PRIORITY
-    if (menu_cursor == TONE_MENU_PRIOR) {
-        FntPrint("> PRIORITY: %d%s\n", current_vag_atr.prior,
-                 isToneValueChanged(TONE_MENU_PRIOR) ? " !" : "");
-    } else {
-        FntPrint("  PRIORITY: %d%s\n", current_vag_atr.prior,
-                 isToneValueChanged(TONE_MENU_PRIOR) ? " !" : "");
-    }
-    
-    // MODE
-    if (menu_cursor == TONE_MENU_MODE) {
-        FntPrint("> MODE: %s%s\n", current_vag_atr.mode == 0 ? "NORMAL" : "REVERB",
-                 isToneValueChanged(TONE_MENU_MODE) ? " !" : "");
-    } else {
-        FntPrint("  MODE: %s%s\n", current_vag_atr.mode == 0 ? "NORMAL" : "REVERB",
-                 isToneValueChanged(TONE_MENU_MODE) ? " !" : "");
-    }
-    
-    // VOLUME
-    if (menu_cursor == TONE_MENU_VOL) {
-        FntPrint("> VOL: %d%s\n", current_vag_atr.vol,
-                 isToneValueChanged(TONE_MENU_VOL) ? " !" : "");
-    } else {
-        FntPrint("  VOL: %d%s\n", current_vag_atr.vol,
-                 isToneValueChanged(TONE_MENU_VOL) ? " !" : "");
-    }
-    
-    // PAN
-    if (menu_cursor == TONE_MENU_PAN) {
-        FntPrint("> PAN: %d%s\n", current_vag_atr.pan,
-                 isToneValueChanged(TONE_MENU_PAN) ? " !" : "");
-    } else {
-        FntPrint("  PAN: %d%s\n", current_vag_atr.pan,
-                 isToneValueChanged(TONE_MENU_PAN) ? " !" : "");
-    }
-    
-    // CENTER NOTE
-    center_octave = (current_vag_atr.center / 12) - 1;
-    center_note_name = note_names[current_vag_atr.center % 12];
-    if (menu_cursor == TONE_MENU_CENTER) {
-        FntPrint("> CENTER: %d(%s%d)%s\n", current_vag_atr.center, center_note_name, center_octave,
-                 isToneValueChanged(TONE_MENU_CENTER) ? " !" : "");
-    } else {
-        FntPrint("  CENTER: %d(%s%d)%s\n", current_vag_atr.center, center_note_name, center_octave,
-                 isToneValueChanged(TONE_MENU_CENTER) ? " !" : "");
-    }
-    
-    // SHIFT
-    if (menu_cursor == TONE_MENU_SHIFT) {
-        FntPrint("> SHIFT: %d%s\n", current_vag_atr.shift,
-                 isToneValueChanged(TONE_MENU_SHIFT) ? " !" : "");
-    } else {
-        FntPrint("  SHIFT: %d%s\n", current_vag_atr.shift,
-                 isToneValueChanged(TONE_MENU_SHIFT) ? " !" : "");
-    }
-    
-    // MIN/MAX
-    if (menu_cursor == TONE_MENU_MIN) {
-        FntPrint("> MIN: %d%s\n", current_vag_atr.min,
-                 isToneValueChanged(TONE_MENU_MIN) ? " !" : "");
-    } else {
-        FntPrint("  MIN: %d%s\n", current_vag_atr.min,
-                 isToneValueChanged(TONE_MENU_MIN) ? " !" : "");
-    }
-    
-    if (menu_cursor == TONE_MENU_MAX) {
-        FntPrint("> MAX: %d%s\n", current_vag_atr.max,
-                 isToneValueChanged(TONE_MENU_MAX) ? " !" : "");
-    } else {
-        FntPrint("  MAX: %d%s\n", current_vag_atr.max,
-                 isToneValueChanged(TONE_MENU_MAX) ? " !" : "");
-    }
-    
-    // PITCH BEND
-    if (menu_cursor == TONE_MENU_PBMIN) {
-        FntPrint("> PBMIN: %d%s\n", current_vag_atr.pbmin,
-                 isToneValueChanged(TONE_MENU_PBMIN) ? " !" : "");
-    } else {
-        FntPrint("  PBMIN: %d%s\n", current_vag_atr.pbmin,
-                 isToneValueChanged(TONE_MENU_PBMIN) ? " !" : "");
-    }
-    
-    if (menu_cursor == TONE_MENU_PBMAX) {
-        FntPrint("> PBMAX: %d%s\n", current_vag_atr.pbmax,
-                 isToneValueChanged(TONE_MENU_PBMAX) ? " !" : "");
-    } else {
-        FntPrint("  PBMAX: %d%s\n", current_vag_atr.pbmax,
-                 isToneValueChanged(TONE_MENU_PBMAX) ? " !" : "");
-    }
-    
-    // ADSR1 - Press X to enter parameter editor
-    if (menu_cursor == TONE_MENU_ADSR1) {
-        FntPrint("> ADSR1: 0x%04X (X:EDIT)%s\n", current_vag_atr.adsr1,
-                 isToneValueChanged(TONE_MENU_ADSR1) ? " !" : "");
-    } else {
-        FntPrint("  ADSR1: 0x%04X%s\n", current_vag_atr.adsr1,
-                 isToneValueChanged(TONE_MENU_ADSR1) ? " !" : "");
-    }
-    
-    // ADSR2 - Press X to enter parameter editor
-    if (menu_cursor == TONE_MENU_ADSR2) {
-        FntPrint("> ADSR2: 0x%04X (X:EDIT)%s\n", current_vag_atr.adsr2,
-                 isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
-    } else {
-        FntPrint("  ADSR2: 0x%04X%s\n", current_vag_atr.adsr2,
-                 isToneValueChanged(TONE_MENU_ADSR2) ? " !" : "");
-    }
+    // ADSR1 / ADSR2 - Press X to enter parameter editor
+    FntPrint("%c ADSR1: 0x%04X%s%s\n", CUR(TONE_MENU_ADSR1), current_vag_atr.adsr1,
+             SEL(TONE_MENU_ADSR1, " (X:EDIT)"), CHG(isToneValueChanged, TONE_MENU_ADSR1));
+    FntPrint("%c ADSR2: 0x%04X%s%s\n", CUR(TONE_MENU_ADSR2), current_vag_atr.adsr2,
+             SEL(TONE_MENU_ADSR2, " (X:EDIT)"), CHG(isToneValueChanged, TONE_MENU_ADSR2));
     FntPrint("-------------------\n");
 
     FntPrint("\n");
@@ -3661,6 +3288,9 @@ void drawToneEdit(void)
 
 void drawAdsrEdit(void)
 {
+    int i, v;
+    u_short temp_adsr1, temp_adsr2;
+
     FntPrint("\n");
     FntPrint("=== ADSR EDITOR ===");
 
@@ -3683,7 +3313,6 @@ void drawAdsrEdit(void)
     }
     
     // Display current hex values
-    u_short temp_adsr1, temp_adsr2;
     encodeADSR(&current_adsr, &temp_adsr1, &temp_adsr2);
     FntPrint("ADSR1: 0x%04X\n", temp_adsr1);
     FntPrint("ADSR2: 0x%04X\n\n", temp_adsr2);
@@ -3693,102 +3322,22 @@ void drawAdsrEdit(void)
 	FntPrint("\n");
 	FntPrint("-------------------\n");
     
-    // Attack Rate
-    if (menu_cursor == ADSR_MENU_ATTACK_RATE) {
-        FntPrint("> ATTACK RATE: %d%s\n", current_adsr.attack,
-                 isAdsrValueChanged(ADSR_MENU_ATTACK_RATE) ? " !" : "");
-    } else {
-        FntPrint("  ATTACK RATE: %d%s\n", current_adsr.attack,
-                 isAdsrValueChanged(ADSR_MENU_ATTACK_RATE) ? " !" : "");
-    }
-    
-    // Attack Exponential
-    if (menu_cursor == ADSR_MENU_ATTACK_EXP) {
-        FntPrint("> ATTACK EXP: %s%s\n", current_adsr.attackExponential ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_ATTACK_EXP) ? " !" : "");
-    } else {
-        FntPrint("  ATTACK EXP: %s%s\n", current_adsr.attackExponential ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_ATTACK_EXP) ? " !" : "");
-    }
-    
-    // Decay Rate
-    if (menu_cursor == ADSR_MENU_DECAY_RATE) {
-        FntPrint("> DECAY RATE: %d%s\n", current_adsr.decay,
-                 isAdsrValueChanged(ADSR_MENU_DECAY_RATE) ? " !" : "");
-    } else {
-        FntPrint("  DECAY RATE: %d%s\n", current_adsr.decay,
-                 isAdsrValueChanged(ADSR_MENU_DECAY_RATE) ? " !" : "");
-    }
-    
-    // Sustain Level
-    if (menu_cursor == ADSR_MENU_SUSTAIN_LEVEL) {
-        FntPrint("> SUSTAIN LEVEL: %d%s\n", current_adsr.sustainLevel,
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_LEVEL) ? " !" : "");
-    } else {
-        FntPrint("  SUSTAIN LEVEL: %d%s\n", current_adsr.sustainLevel,
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_LEVEL) ? " !" : "");
-    }
-    
-    // Sustain Rate
-    if (menu_cursor == ADSR_MENU_SUSTAIN_RATE) {
-        FntPrint("> SUSTAIN RATE: %d%s\n", current_adsr.sustain,
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_RATE) ? " !" : "");
-    } else {
-        FntPrint("  SUSTAIN RATE: %d%s\n", current_adsr.sustain,
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_RATE) ? " !" : "");
-    }
-    
-    // Sustain Signed
-    if (menu_cursor == ADSR_MENU_SUSTAIN_SIGNED) {
-        FntPrint("> SUSTAIN SIGN: %s%s\n", current_adsr.sustainSigned ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_SIGNED) ? " !" : "");
-    } else {
-        FntPrint("  SUSTAIN SIGN: %s%s\n", current_adsr.sustainSigned ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_SIGNED) ? " !" : "");
-    }
-    
-    // Sustain Exponential
-    if (menu_cursor == ADSR_MENU_SUSTAIN_EXP) {
-        FntPrint("> SUSTAIN EXP: %s%s\n", current_adsr.sustainExponential ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_EXP) ? " !" : "");
-    } else {
-        FntPrint("  SUSTAIN EXP: %s%s\n", current_adsr.sustainExponential ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_SUSTAIN_EXP) ? " !" : "");
-    }
-    
-    // Release Rate
-    if (menu_cursor == ADSR_MENU_RELEASE_RATE) {
-        FntPrint("> RELEASE RATE: %d%s\n", current_adsr.release,
-                 isAdsrValueChanged(ADSR_MENU_RELEASE_RATE) ? " !" : "");
-    } else {
-        FntPrint("  RELEASE RATE: %d%s\n", current_adsr.release,
-                 isAdsrValueChanged(ADSR_MENU_RELEASE_RATE) ? " !" : "");
-    }
-    
-    // Release Exponential
-    if (menu_cursor == ADSR_MENU_RELEASE_EXP) {
-        FntPrint("> RELEASE EXP: %s%s\n", current_adsr.releaseExponential ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_RELEASE_EXP) ? " !" : "");
-    } else {
-        FntPrint("  RELEASE EXP: %s%s\n", current_adsr.releaseExponential ? "ON" : "OFF",
-                 isAdsrValueChanged(ADSR_MENU_RELEASE_EXP) ? " !" : "");
+    // Attack/decay/sustain/release rows (numbers, or ON/OFF for toggle rows)
+    for (i = 0; i < ADSR_MENU_SAVE; i++) {
+        v = *adsrFieldPtr(&current_adsr, i);
+        if (adsr_fields[i].max == 1) {
+            FntPrint("%c %s: %s%s\n", CUR(i), adsr_fields[i].label,
+                     v ? "ON" : "OFF", CHG(isAdsrValueChanged, i));
+        } else {
+            FntPrint("%c %s: %d%s\n", CUR(i), adsr_fields[i].label,
+                     v, CHG(isAdsrValueChanged, i));
+        }
     }
     
     FntPrint("\n");
     
-    // Save option
-    if (menu_cursor == ADSR_MENU_SAVE) {
-        FntPrint("> SAVE\n");
-    } else {
-        FntPrint("  SAVE\n");
-    }
-    
-    // Cancel option
-    if (menu_cursor == ADSR_MENU_CANCEL) {
-        FntPrint("> CANCEL\n");
-    } else {
-        FntPrint("  CANCEL\n");
-    }
+    FntPrint("%c SAVE\n",   CUR(ADSR_MENU_SAVE));
+    FntPrint("%c CANCEL\n", CUR(ADSR_MENU_CANCEL));
 	FntPrint("-------------------\n");
     
     FntPrint("\n");
@@ -4000,6 +3549,36 @@ static void buildBar(int voice, char key_status_now, char* bar10)
     bar10[10] = '\0';
 }
 
+// Fill in the key/note/bar/reverb strings for one SPU voice
+static void visVoiceInfo(int v, const char* key_status, const short* note_map,
+                         char* note, char* bar, char* key, const char** rev)
+{
+    u_short seq_note_raw;
+
+    switch (key_status[v]) {
+        case SPU_ON:
+        case SPU_ON_ENV_OFF: *key = 'S'; break;
+        case SPU_OFF_ENV_ON: *key = 'R'; break;
+        default:             *key = '-'; break;
+    }
+
+    if (key_status[v] != SPU_OFF) {
+        if (note_map[v] >= 0) {
+            formatVoiceNote((int)note_map[v], note);
+        } else if (!vab_mode) {
+            SpuGetVoiceNote(v, &seq_note_raw);
+            formatNoteOffset((int)((seq_note_raw >> 8) & 0xFF) - 0xC0, note);
+        } else {
+            note[0] = '-'; note[1] = '-'; note[2] = '-'; note[3] = '\0';
+        }
+    } else {
+        note[0] = '-'; note[1] = '-'; note[2] = '-'; note[3] = '\0';
+    }
+
+    *rev = (reverb_type > 0 && key_status[v] != SPU_OFF) ? "REV" : "---";
+    buildBar(v, key_status[v], bar);
+}
+
 void drawVisualizer(void)
 {
     char key_status[24];
@@ -4008,7 +3587,6 @@ void drawVisualizer(void)
     char bar_l[11], bar_r[11];
     char key_l, key_r;
     const char *rev_l, *rev_r;
-    u_short seq_note_raw;
 
     // Build a voice-index/MIDI-note lookup SsUtKeyOn
     short voice_note_map[24];
@@ -4030,53 +3608,8 @@ void drawVisualizer(void)
     FntPrint("\n=== SPU VOICES ===\n\n");
 
     for (i = 0; i < 24; i += 2) {
-        // ---- LEFT VOICE (i) ----
-        switch (key_status[i]) {
-            case SPU_ON:
-            case SPU_ON_ENV_OFF: key_l = 'S'; break;
-            case SPU_OFF_ENV_ON: key_l = 'R'; break;
-            default:             key_l = '-'; break;
-        }
-
-        if (key_status[i] != SPU_OFF) {
-            if (voice_note_map[i] >= 0) {
-                formatVoiceNote((int)voice_note_map[i], note_l);
-            } else if (!vab_mode) {
-                SpuGetVoiceNote(i, &seq_note_raw);
-                formatNoteOffset((int)((seq_note_raw >> 8) & 0xFF) - 0xC0, note_l);
-            } else {
-                note_l[0] = '-'; note_l[1] = '-'; note_l[2] = '-'; note_l[3] = '\0';
-            }
-        } else {
-            note_l[0] = '-'; note_l[1] = '-'; note_l[2] = '-'; note_l[3] = '\0';
-        }
-
-        rev_l = (reverb_type > 0 && key_status[i] != SPU_OFF) ? "REV" : "---";
-        buildBar(i, key_status[i], bar_l);
-
-        // ---- RIGHT VOICE (i+1) ----
-        switch (key_status[i + 1]) {
-            case SPU_ON:
-            case SPU_ON_ENV_OFF: key_r = 'S'; break;
-            case SPU_OFF_ENV_ON: key_r = 'R'; break;
-            default:             key_r = '-'; break;
-        }
-
-        if (key_status[i + 1] != SPU_OFF) {
-            if (voice_note_map[i + 1] >= 0) {
-                formatVoiceNote((int)voice_note_map[i + 1], note_r);
-            } else if (!vab_mode) {
-                SpuGetVoiceNote(i + 1, &seq_note_raw);
-                formatNoteOffset((int)((seq_note_raw >> 8) & 0xFF) - 0xC0, note_r);
-            } else {
-                note_r[0] = '-'; note_r[1] = '-'; note_r[2] = '-'; note_r[3] = '\0';
-            }
-        } else {
-            note_r[0] = '-'; note_r[1] = '-'; note_r[2] = '-'; note_r[3] = '\0';
-        }
-
-        rev_r = (reverb_type > 0 && key_status[i + 1] != SPU_OFF) ? "REV" : "---";
-        buildBar(i + 1, key_status[i + 1], bar_r);
+        visVoiceInfo(i,     key_status, voice_note_map, note_l, bar_l, &key_l, &rev_l);
+        visVoiceInfo(i + 1, key_status, voice_note_map, note_r, bar_r, &key_r, &rev_r);
 
         // ---- Print voice info line ----
         // Format: "V00 C#4 KEY:S REV / V01 --- KEY:- ---"
@@ -4199,12 +3732,12 @@ void drawDebug(void)
 
 void drawUI(void)
 {
-	#if HAS_BACKGROUND_IMAGE
-		// Don't draw UI text when in full image mode (bg_state == 2)
-		if (bg_state == 2) {
-			return;
-		}
-	#endif
+#if HAS_BACKGROUND_IMAGE
+    // Don't draw UI text when in full image mode (bg_state == 2)
+    if (bg_state == 2) {
+        return;
+    }
+#endif
     
     switch (current_state) {
         case STATE_SEQ_SELECT:
@@ -4234,6 +3767,11 @@ void drawUI(void)
         case STATE_VISUALIZER:
             drawVisualizer();
             break;
+#ifdef ENABLE_CD_BROWSER
+        case STATE_CD_BROWSER:
+            drawCdBrowser();
+            break;
+#endif
 #ifdef ENABLE_DEBUG_MENU
         case STATE_DEBUG:
             drawDebug();
@@ -4257,20 +3795,20 @@ int main(void)
     {
         processInput();
         
-		#if HAS_BACKGROUND_IMAGE
-			drawBackground();  // Draw background image first if enabled
-		#endif
+#if HAS_BACKGROUND_IMAGE
+        drawBackground();  // Draw background image first if enabled
+#endif
 				
-		drawUI();
+        drawUI();
 				
-		#if HAS_BACKGROUND_IMAGE
-			// Only flush font buffer when not in full image mode
-			if (bg_state != 2) {
-				FntFlush(-1);
-			}
-		#else
-			FntFlush(-1);
-		#endif
+#if HAS_BACKGROUND_IMAGE
+        // Only flush font buffer when not in full image mode
+        if (bg_state != 2) {
+            FntFlush(-1);
+        }
+#else
+        FntFlush(-1);
+#endif
         
         display();
         
